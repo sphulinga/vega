@@ -1,0 +1,48 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+dist/
+*.egg-info/
+.eggs/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Test artifacts / reports
+test-results/
+*.log
+
+# Vendored / fetched third-party sources (fetched via scripts/fetch_spark_tests.sh)
+third_party/spark/
+
+# Scala / metals scratch
+.scala-build/
+.bloop/
+.metals/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

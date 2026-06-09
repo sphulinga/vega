@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python build/runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Configure (CMake)
+        run: >
+          cmake -S . -B build-release
+          -DCMAKE_BUILD_TYPE=Release
+          -DVEGA_BUILD_SERVER=ON
+
+      - name: Build
+        run: cmake --build build-release -j 4
+
+      - name: C++ tests (ctest)
+        working-directory: build-release
+        run: ctest --output-on-failure
+
+      - name: PyVega Python tests
+        env:
+          VEGA_SERVER: ${{ github.workspace }}/build-release/vega_server
+          PYTHONPATH: ${{ github.workspace }}/python
+        run: python -m pytest python/tests/test_pyvega.py -q
+
+  pyspark-compat:
+    name: PySpark RDD compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Configure & build vega_server
+        run: |
+          cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DVEGA_BUILD_SERVER=ON
+          cmake --build build-release --target vega_server -j 4
+
+      - name: Fetch Spark test sources
+        run: ./scripts/fetch_spark_tests.sh
+
+      - name: Run PySpark RDD compatibility suite
+        env:
+          VEGA_SERVER: ${{ github.workspace }}/build-release/vega_server
+        run: |
+          # The runner exits non-zero on the 4 known JVM-only tests, which
+          # require a JVM/Java RDD and cannot pass against PyVega. We tolerate
+          # those here and gate on the JSON report instead.
+          python scripts/run_pyspark_tests.py --filter pyspark.tests.test_rdd || true
+          python - <<'PY'
+          import json, sys
+          with open("test-results/pyspark_vs_pyvega.json") as f:
+              report = json.load(f)
+          s = report["summary"]
+          print(f"passed={s['passed']} failed={s['failed']} errors={s['errors']}")
+          # Allowed: up to 4 JVM-only errors (_jvm, _jrdd, _to_java_object_rdd,
+          # SparkSession.createDataFrame). No plain failures are allowed.
+          MAX_JVM_ERRORS = 4
+          problems = []
+          if s["failed"] != 0:
+              problems.append(f"{s['failed']} unexpected test failures")
+          if s["errors"] > MAX_JVM_ERRORS:
+              problems.append(
+                  f"{s['errors']} errors exceed the {MAX_JVM_ERRORS} known JVM-only tests"
+              )
+          if s["import_failures"]:
+              problems.append(f"{s['import_failures']} import failures")
+          if problems:
+              sys.exit("PySpark compat regression: " + "; ".join(problems))
+          print("PySpark compatibility within expected bounds.")
+          PY
