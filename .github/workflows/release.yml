@@ -94,10 +94,15 @@ jobs:
         uses: pypa/cibuildwheel@v2.23.3
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
+      # The runner's system Python is externally managed (PEP 668), so check
+      # metadata with a dedicated interpreter.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Check metadata
         run: |
-          python3 -m pip install --upgrade twine
-          python3 -m twine check --strict wheelhouse/*.whl
+          python -m pip install --upgrade twine
+          python -m twine check --strict wheelhouse/*.whl
       - uses: actions/upload-artifact@v4
         with:
           name: dist-wheels-${{ matrix.name }}
