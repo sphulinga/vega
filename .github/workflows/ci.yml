@@ -61,8 +61,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.13"]
+        include:
+          # actions/setup-python has no CPython 3.9 for newer runner images
+          # (ubuntu-latest is 26.04); test the oldest supported version on an
+          # image that still provides it.
+          - { os: ubuntu-24.04, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
