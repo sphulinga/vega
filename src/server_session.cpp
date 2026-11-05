@@ -3,7 +3,10 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -27,12 +30,16 @@ namespace py = pybind11;
 
 namespace {
 
+// Bumped whenever new message types are added. v2 = server-side operators.
+constexpr uint32_t kProtocolVersion = 2;
+
 enum class StageOp : uint8_t {
     Map = 1,
     Filter = 2,
     FlatMap = 3,
     ReduceByKey = 4,
     GroupByKey = 5,
+    MapPartitions = 6,  // func(partition_index, iterator) -> iterable
 };
 
 enum class ActionOp : uint8_t {
@@ -67,22 +74,89 @@ static py::object* py_find_agg(PyAggBucket& bucket, const py::object& key) {
     return nullptr;
 }
 
-static void py_accumulate(std::unordered_map<size_t, PyAggBucket>& groups,
-                          py::object key,
-                          py::object value,
-                          const py::object& combine) {
-    PyAggBucket& bucket = groups[py_hash(key)];
-    if (py::object* acc = py_find_agg(bucket, key))
-        *acc = combine(*acc, value);
-    else
-        bucket.emplace_back(std::move(key), std::move(value));
-}
-
 static size_t py_distinct_keys(const std::unordered_map<size_t, PyAggBucket>& groups) {
     size_t count = 0;
     for (const auto& [_, bucket] : groups)
         count += bucket.size();
     return count;
+}
+
+
+// ---------------------------------------------------------------------------
+// Fast UDF invocation helpers.
+//
+// User functions are called straight through the CPython C API instead of
+// via a Python-level try/except wrapper, which removes one interpreted frame
+// per element. A StopIteration escaping user code is converted to a
+// RuntimeError (Spark semantics) here in C++.
+// ---------------------------------------------------------------------------
+
+[[noreturn]] static void raise_udf_error() {
+    if (PyErr_ExceptionMatches(PyExc_StopIteration)) {
+        PyObject *type = nullptr, *value = nullptr, *tb = nullptr;
+        PyErr_Fetch(&type, &value, &tb);
+        PyErr_NormalizeException(&type, &value, &tb);
+        PyErr_SetString(PyExc_RuntimeError,
+                        "Caught StopIteration thrown from user's code; failing the task");
+        PyObject *ntype = nullptr, *nvalue = nullptr, *ntb = nullptr;
+        PyErr_Fetch(&ntype, &nvalue, &ntb);
+        PyErr_NormalizeException(&ntype, &nvalue, &ntb);
+        if (value) {
+            PyException_SetCause(nvalue, value);  // steals value
+        }
+        Py_XDECREF(type);
+        Py_XDECREF(tb);
+        PyErr_Restore(ntype, nvalue, ntb);
+    }
+    throw py::error_already_set();
+}
+
+static inline py::object udf_call1(const py::object& func, const py::object& arg) {
+    PyObject* r = PyObject_CallOneArg(func.ptr(), arg.ptr());
+    if (!r) raise_udf_error();
+    return py::reinterpret_steal<py::object>(r);
+}
+
+static inline py::object udf_call2(const py::object& func,
+                                   const py::object& a,
+                                   const py::object& b) {
+    PyObject* args[2] = {a.ptr(), b.ptr()};
+    PyObject* r = PyObject_Vectorcall(func.ptr(), args, 2, nullptr);
+    if (!r) raise_udf_error();
+    return py::reinterpret_steal<py::object>(r);
+}
+
+static inline bool udf_truthy(const py::object& obj) {
+    const int t = PyObject_IsTrue(obj.ptr());
+    if (t < 0) raise_udf_error();
+    return t == 1;
+}
+
+// Iterate any Python iterable, invoking `fn` with each item (new reference).
+template<typename Fn>
+static void udf_iterate(const py::object& iterable, Fn&& fn) {
+    PyObject* it = PyObject_GetIter(iterable.ptr());
+    if (!it) raise_udf_error();
+    py::object iter = py::reinterpret_steal<py::object>(it);
+    while (PyObject* item = PyIter_Next(iter.ptr()))
+        fn(py::reinterpret_steal<py::object>(item));
+    if (PyErr_Occurred()) raise_udf_error();
+}
+
+// Build a Python list from a partition vector (moves the references).
+static py::list py_list_from(std::vector<py::object>&& items) {
+    PyObject* lst = PyList_New(static_cast<Py_ssize_t>(items.size()));
+    if (!lst) throw py::error_already_set();
+    for (size_t i = 0; i < items.size(); ++i)
+        PyList_SET_ITEM(lst, static_cast<Py_ssize_t>(i), items[i].release().ptr());
+    items.clear();
+    return py::reinterpret_steal<py::list>(lst);
+}
+
+static inline std::vector<py::object>& py_vec_ref(std::any& a) {
+    auto* p = std::any_cast<std::vector<py::object>>(&a);
+    if (!p) throw std::runtime_error("expected a Python partition");
+    return *p;
 }
 
 // Source RDD: integer range [start, end) as native int64 (no Python objects).
@@ -681,7 +755,7 @@ public:
         std::vector<py::object> output;
         output.reserve(input.size());
         for (auto& elem : input)
-            output.push_back(func_(std::move(elem)));
+            output.push_back(udf_call1(func_, elem));
         return output;
     }
 
@@ -689,7 +763,7 @@ public:
         py::gil_scoped_acquire acquire;
         auto input = py_parent_partition(parent_, pid);
         for (const auto& elem : input)
-            (void)func_(elem);
+            (void)udf_call1(func_, elem);
         return input.size();
     }
 
@@ -720,7 +794,7 @@ public:
         std::vector<py::object> output;
         output.reserve(input.size());
         for (auto& elem : input) {
-            if (py::cast<bool>(pred_(elem)))
+            if (udf_truthy(udf_call1(pred_, elem)))
                 output.push_back(std::move(elem));
         }
         return output;
@@ -731,7 +805,7 @@ public:
         auto input = py_parent_partition(parent_, pid);
         size_t out = 0;
         for (const auto& elem : input) {
-            if (py::cast<bool>(pred_(elem))) ++out;
+            if (udf_truthy(udf_call1(pred_, elem))) ++out;
         }
         return out;
     }
@@ -763,9 +837,10 @@ public:
         std::vector<py::object> output;
         output.reserve(input.size());
         for (auto& elem : input) {
-            py::object mapped = func_(std::move(elem));
-            for (auto item : mapped)
-                output.push_back(py::reinterpret_borrow<py::object>(item));
+            py::object mapped = udf_call1(func_, elem);
+            udf_iterate(mapped, [&](py::object item) {
+                output.push_back(std::move(item));
+            });
         }
         return output;
     }
@@ -775,8 +850,14 @@ public:
         auto input = py_parent_partition(parent_, pid);
         size_t out = 0;
         for (auto& elem : input) {
-            py::object mapped = func_(std::move(elem));
-            out += static_cast<size_t>(py::len(mapped));
+            py::object mapped = udf_call1(func_, elem);
+            const Py_ssize_t n = PyObject_Length(mapped.ptr());
+            if (n >= 0) {
+                out += static_cast<size_t>(n);
+            } else {
+                PyErr_Clear();
+                udf_iterate(mapped, [&](py::object) { ++out; });
+            }
         }
         return out;
     }
@@ -790,182 +871,141 @@ private:
     py::object func_;
 };
 
+// Shared machinery for Python key/value shuffles. Map outputs are bucketed
+// by hash(key) % N and combined *while bucketing* (map-side combine), so the
+// reduce side only emits pre-aggregated groups. The materialized buckets are
+// kept so later actions on the same RDD skip the map stage (shuffle reuse).
+using PyGroups = std::unordered_map<size_t, PyAggBucket>;
+
+static py::tuple py_kv(const py::object& item, const char* op) {
+    if (!PyTuple_Check(item.ptr()) || PyTuple_GET_SIZE(item.ptr()) < 2) {
+        if (PyList_Check(item.ptr()) && PyList_GET_SIZE(item.ptr()) == 2)
+            return py::tuple(py::reinterpret_borrow<py::list>(item));
+        throw std::runtime_error(std::string(op) + ": map output is not a (key, value) tuple");
+    }
+    return py::reinterpret_borrow<py::tuple>(item);
+}
+
+class PyKeyedShuffleRDDBase : public vega::RDDBase {
+public:
+    PyKeyedShuffleRDDBase(std::shared_ptr<vega::RDDBase> parent, size_t num_partitions)
+        : parent_(std::move(parent)), num_partitions_(std::max<size_t>(1, num_partitions)) {
+        groups_.resize(num_partitions_);
+    }
+
+    size_t num_partitions() const override { return num_partitions_; }
+    bool is_narrow() const override { return false; }
+    bool uses_python_runtime() const override { return true; }
+    bool shuffle_ready() const override { return shuffle_ready_; }
+
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        return {parent_};
+    }
+
+    void prepare_shuffle(const std::vector<std::any>& parent_results) override {
+        py::gil_scoped_acquire acquire;
+        for (auto& g : groups_)
+            g.clear();
+        shuffle_ready_ = false;
+        for (const auto& pr : parent_results) {
+            if (!pr.has_value())
+                throw std::runtime_error(std::string(op_name()) + ": empty map partition result");
+            const auto* data = std::any_cast<std::vector<py::object>>(&pr);
+            if (!data)
+                throw std::runtime_error(std::string(op_name()) + ": unexpected map output type");
+            for (const auto& item : *data) {
+                py::tuple t = py_kv(item, op_name());
+                py::object k = t[0];
+                py::object v = t[1];
+                const size_t h = py_hash(k);
+                add(groups_[h % num_partitions_][h], std::move(k), std::move(v));
+            }
+        }
+        shuffle_ready_ = true;
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        check_ready();
+        std::vector<py::object> result;
+        result.reserve(py_distinct_keys(groups_[pid]));
+        for (const auto& [_, bucket] : groups_[pid]) {
+            for (const auto& [k, v] : bucket)
+                result.push_back(emit(k, v));
+        }
+        return result;
+    }
+
+    size_t compute_partition_count(size_t pid) const override {
+        check_ready();
+        return py_distinct_keys(groups_[pid]);
+    }
+
+protected:
+    virtual const char* op_name() const = 0;
+    virtual void add(PyAggBucket& bucket, py::object key, py::object value) = 0;
+    virtual py::object emit(const py::object& key, const py::object& value) const {
+        return py::make_tuple(key, value);
+    }
+
+private:
+    void check_ready() const {
+        if (!shuffle_ready_)
+            throw std::runtime_error(std::string(op_name()) + ": shuffle data not prepared");
+    }
+
+    std::shared_ptr<vega::RDDBase> parent_;
+    size_t num_partitions_;
+    bool shuffle_ready_ = false;
+    std::vector<PyGroups> groups_;
+};
+
 // reduceByKey for Python (k, v) tuples stored as py::object.
-class PyReduceByKeyRDDImpl : public vega::RDDBase {
+class PyReduceByKeyRDDImpl : public PyKeyedShuffleRDDBase {
 public:
     PyReduceByKeyRDDImpl(std::shared_ptr<vega::RDDBase> parent,
                          py::object combine,
                          size_t num_partitions)
-        : parent_(std::move(parent))
-        , combine_(std::move(combine))
-        , num_partitions_(num_partitions)
-    {
-        buckets_.resize(num_partitions_);
-    }
+        : PyKeyedShuffleRDDBase(std::move(parent), num_partitions)
+        , combine_(std::move(combine)) {}
 
-    size_t num_partitions() const override { return num_partitions_; }
-    bool is_narrow() const override { return false; }
-
-    bool uses_python_runtime() const override { return true; }
-
-    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
-        return {parent_};
-    }
-
-    void prepare_shuffle(const std::vector<std::any>& parent_results) override {
-        py::gil_scoped_acquire acquire;
-        for (auto& bucket : buckets_)
-            bucket.clear();
-        shuffle_ready_ = false;
-        for (const auto& pr : parent_results) {
-            if (!pr.has_value())
-                throw std::runtime_error("reduceByKey: empty map partition result");
-            auto data = std::any_cast<std::vector<py::object>>(pr);
-            for (auto& item : data) {
-                if (!py::isinstance<py::tuple>(item))
-                    throw std::runtime_error("reduceByKey: map output is not tuple");
-                py::tuple t = py::reinterpret_borrow<py::tuple>(item);
-                py::object k = t[0];
-                py::object v = t[1];
-                const size_t bucket = py_hash(k) % num_partitions_;
-                buckets_[bucket].emplace_back(std::move(k), std::move(v));
-            }
-        }
-        shuffle_ready_ = true;
-    }
-
-    std::any compute_partition(size_t pid) const override {
-        py::gil_scoped_acquire acquire;
-        if (!shuffle_ready_)
-            throw std::runtime_error("reduceByKey: shuffle data not prepared");
-
-        std::unordered_map<size_t, PyAggBucket> groups;
-        groups.reserve(buckets_[pid].size());
-        for (const auto& [k, v] : buckets_[pid])
-            py_accumulate(groups, k, v, combine_);
-
-        std::vector<py::object> result;
-        result.reserve(py_distinct_keys(groups));
-        for (const auto& [_, bucket] : groups) {
-            for (const auto& [k, v] : bucket)
-                result.push_back(py::make_tuple(k, v));
-        }
-        return result;
-    }
-
-    size_t compute_partition_count(size_t pid) const override {
-        py::gil_scoped_acquire acquire;
-        if (!shuffle_ready_)
-            throw std::runtime_error("reduceByKey: shuffle data not prepared");
-        std::unordered_map<size_t, PyAggBucket> groups;
-        groups.reserve(buckets_[pid].size());
-        for (const auto& [k, v] : buckets_[pid]) {
-            (void)v;
-            PyAggBucket& bucket = groups[py_hash(k)];
-            if (!py_find_agg(bucket, k))
-                bucket.emplace_back(k, py::object());
-        }
-        return py_distinct_keys(groups);
+protected:
+    const char* op_name() const override { return "reduceByKey"; }
+    void add(PyAggBucket& bucket, py::object key, py::object value) override {
+        if (py::object* acc = py_find_agg(bucket, key))
+            *acc = udf_call2(combine_, *acc, value);
+        else
+            bucket.emplace_back(std::move(key), std::move(value));
     }
 
 private:
-    std::shared_ptr<vega::RDDBase> parent_;
     py::object combine_;
-    size_t num_partitions_;
-    bool shuffle_ready_ = false;
-    std::vector<std::vector<std::pair<py::object, py::object>>> buckets_;
 };
 
-static void py_group_append(std::unordered_map<size_t, PyAggBucket>& groups,
-                            py::object key,
-                            py::object value) {
-    PyAggBucket& bucket = groups[py_hash(key)];
-    if (py::object* acc = py_find_agg(bucket, key)) {
-        py::list lst = py::reinterpret_borrow<py::list>(*acc);
-        lst.append(std::move(value));
-    } else {
-        py::list lst;
-        lst.append(std::move(value));
-        bucket.emplace_back(std::move(key), std::move(lst));
-    }
-}
-
-class PyGroupByKeyRDDImpl : public vega::RDDBase {
+class PyGroupByKeyRDDImpl : public PyKeyedShuffleRDDBase {
 public:
     PyGroupByKeyRDDImpl(std::shared_ptr<vega::RDDBase> parent, size_t num_partitions)
-        : parent_(std::move(parent)), num_partitions_(num_partitions) {
-        buckets_.resize(num_partitions_);
-    }
+        : PyKeyedShuffleRDDBase(std::move(parent), num_partitions) {}
 
-    size_t num_partitions() const override { return num_partitions_; }
-    bool is_narrow() const override { return false; }
-    bool uses_python_runtime() const override { return true; }
-
-    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
-        return {parent_};
-    }
-
-    void prepare_shuffle(const std::vector<std::any>& parent_results) override {
-        py::gil_scoped_acquire acquire;
-        for (auto& bucket : buckets_)
-            bucket.clear();
-        shuffle_ready_ = false;
-        for (const auto& pr : parent_results) {
-            if (!pr.has_value())
-                throw std::runtime_error("groupByKey: empty map partition result");
-            auto data = std::any_cast<std::vector<py::object>>(pr);
-            for (auto& item : data) {
-                if (!py::isinstance<py::tuple>(item))
-                    throw std::runtime_error("groupByKey: map output is not tuple");
-                py::tuple t = py::reinterpret_borrow<py::tuple>(item);
-                py::object k = t[0];
-                py::object v = t[1];
-                const size_t bucket = py_hash(k) % num_partitions_;
-                buckets_[bucket].emplace_back(std::move(k), std::move(v));
-            }
+protected:
+    const char* op_name() const override { return "groupByKey"; }
+    void add(PyAggBucket& bucket, py::object key, py::object value) override {
+        if (py::object* acc = py_find_agg(bucket, key)) {
+            if (PyList_Append(acc->ptr(), value.ptr()) != 0)
+                throw py::error_already_set();
+        } else {
+            py::list lst;
+            lst.append(std::move(value));
+            bucket.emplace_back(std::move(key), std::move(lst));
         }
-        shuffle_ready_ = true;
     }
-
-    std::any compute_partition(size_t pid) const override {
-        py::gil_scoped_acquire acquire;
-        if (!shuffle_ready_)
-            throw std::runtime_error("groupByKey: shuffle data not prepared");
-
-        std::unordered_map<size_t, PyAggBucket> groups;
-        groups.reserve(buckets_[pid].size());
-        for (const auto& [k, v] : buckets_[pid])
-            py_group_append(groups, k, v);
-
-        std::vector<py::object> result;
-        result.reserve(py_distinct_keys(groups));
-        for (const auto& [_, bucket] : groups) {
-            for (const auto& [k, values] : bucket)
-                result.push_back(py::make_tuple(k, values));
-        }
-        return result;
+    // Hand out a copy so callers mutating the group cannot corrupt the
+    // reusable shuffle output.
+    py::object emit(const py::object& key, const py::object& value) const override {
+        PyObject* copy = PyList_GetSlice(value.ptr(), 0, PyList_GET_SIZE(value.ptr()));
+        if (!copy) throw py::error_already_set();
+        return py::make_tuple(key, py::reinterpret_steal<py::object>(copy));
     }
-
-    size_t compute_partition_count(size_t pid) const override {
-        py::gil_scoped_acquire acquire;
-        if (!shuffle_ready_)
-            throw std::runtime_error("groupByKey: shuffle data not prepared");
-        std::unordered_map<size_t, PyAggBucket> groups;
-        groups.reserve(buckets_[pid].size());
-        for (const auto& [k, v] : buckets_[pid]) {
-            (void)v;
-            PyAggBucket& bucket = groups[py_hash(k)];
-            if (!py_find_agg(bucket, k))
-                bucket.emplace_back(k, py::object());
-        }
-        return py_distinct_keys(groups);
-    }
-
-private:
-    std::shared_ptr<vega::RDDBase> parent_;
-    size_t num_partitions_;
-    bool shuffle_ready_ = false;
-    std::vector<std::vector<std::pair<py::object, py::object>>> buckets_;
 };
 
 class PythonMarkedRDDImpl : public vega::RDDBase {
@@ -1002,6 +1042,8 @@ public:
         inner_->receive_shuffle_data(reduce_pid, data);
     }
     void finalize_shuffle() override { inner_->finalize_shuffle(); }
+    bool shuffle_ready() const override { return inner_->shuffle_ready(); }
+    const vega::RDDBase* identity() const override { return inner_->identity(); }
 
 private:
     std::shared_ptr<vega::RDDBase> inner_;
@@ -1090,10 +1132,375 @@ public:
     }
 
     void finalize_shuffle() override { inner_->finalize_shuffle(); }
+    bool shuffle_ready() const override { return inner_->shuffle_ready(); }
+    const vega::RDDBase* identity() const override { return inner_->identity(); }
 
 private:
     std::shared_ptr<vega::RDDBase> inner_;
 };
+
+
+// ---------------------------------------------------------------------------
+// Server-side Python RDD operators. These keep data inside the server instead
+// of round-tripping partitions through the client.
+// ---------------------------------------------------------------------------
+
+// mapPartitionsWithIndex: func(index, iterator) -> iterable.
+class PyMapPartitionsRDDImpl : public vega::RDDBase {
+public:
+    PyMapPartitionsRDDImpl(std::shared_ptr<vega::RDDBase> parent, py::object func)
+        : parent_(std::move(parent)), func_(std::move(func)) {
+        set_context(parent_->context());
+    }
+
+    bool uses_python_runtime() const override { return true; }
+    size_t num_partitions() const override { return parent_->num_partitions(); }
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        return {parent_};
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        std::vector<py::object> output;
+        run(pid, [&](py::object item) { output.push_back(std::move(item)); });
+        return output;
+    }
+
+    size_t compute_partition_count(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        size_t n = 0;
+        run(pid, [&](py::object) { ++n; });
+        return n;
+    }
+
+private:
+    template<typename Fn>
+    void run(size_t pid, Fn&& fn) const {
+        auto input = py_parent_partition(parent_, pid);
+        py::list lst = py_list_from(std::move(input));
+        py::object it = py::reinterpret_steal<py::object>(PyObject_GetIter(lst.ptr()));
+        if (!it) throw py::error_already_set();
+        py::object result = udf_call2(func_, py::int_(pid), it);
+        if (result.is_none()) return;
+        udf_iterate(result, std::forward<Fn>(fn));
+    }
+
+    std::shared_ptr<vega::RDDBase> parent_;
+    py::object func_;
+};
+
+// union: concatenates the partitions of several parents (narrow).
+class PyUnionRDDImpl : public vega::RDDBase {
+public:
+    explicit PyUnionRDDImpl(std::vector<std::shared_ptr<vega::RDDBase>> parents)
+        : parents_(std::move(parents)) {
+        for (size_t i = 0; i < parents_.size(); ++i)
+            for (size_t p = 0; p < parents_[i]->num_partitions(); ++p)
+                index_.emplace_back(i, p);
+    }
+
+    bool uses_python_runtime() const override { return true; }
+    size_t num_partitions() const override { return index_.size(); }
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        return parents_;
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        const auto& [i, p] = index_.at(pid);
+        return parents_[i]->compute_partition(p);
+    }
+    size_t compute_partition_count(size_t pid) const override {
+        const auto& [i, p] = index_.at(pid);
+        return parents_[i]->compute_partition_count(p);
+    }
+
+private:
+    std::vector<std::shared_ptr<vega::RDDBase>> parents_;
+    std::vector<std::pair<size_t, size_t>> index_;
+};
+
+// coalesce without shuffle: output partition i concatenates a group of
+// parent partitions (narrow).
+class PyCoalescedRDDImpl : public vega::RDDBase {
+public:
+    PyCoalescedRDDImpl(std::shared_ptr<vega::RDDBase> parent,
+                       std::vector<std::vector<size_t>> groups)
+        : parent_(std::move(parent)), groups_(std::move(groups)) {}
+
+    bool uses_python_runtime() const override { return true; }
+    size_t num_partitions() const override { return groups_.size(); }
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        return {parent_};
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        std::vector<py::object> out;
+        for (size_t p : groups_.at(pid)) {
+            auto part = py_parent_partition(parent_, p);
+            out.insert(out.end(), std::make_move_iterator(part.begin()),
+                       std::make_move_iterator(part.end()));
+        }
+        return out;
+    }
+    size_t compute_partition_count(size_t pid) const override {
+        size_t n = 0;
+        for (size_t p : groups_.at(pid))
+            n += parent_->compute_partition_count(p);
+        return n;
+    }
+
+private:
+    std::shared_ptr<vega::RDDBase> parent_;
+    std::vector<std::vector<size_t>> groups_;
+};
+
+// cartesian: partition (i, j) = left[i] x right[j].
+class PyCartesianRDDImpl : public vega::RDDBase {
+public:
+    PyCartesianRDDImpl(std::shared_ptr<vega::RDDBase> left,
+                       std::shared_ptr<vega::RDDBase> right)
+        : left_(std::move(left)), right_(std::move(right)) {}
+
+    bool uses_python_runtime() const override { return true; }
+    size_t num_partitions() const override {
+        return left_->num_partitions() * right_->num_partitions();
+    }
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        return {left_, right_};
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        const size_t m = right_->num_partitions();
+        auto a = py_parent_partition(left_, pid / m);
+        auto b = py_parent_partition(right_, pid % m);
+        std::vector<py::object> out;
+        out.reserve(a.size() * b.size());
+        for (const auto& x : a)
+            for (const auto& y : b)
+                out.push_back(py::make_tuple(x, y));
+        return out;
+    }
+    size_t compute_partition_count(size_t pid) const override {
+        const size_t m = right_->num_partitions();
+        return left_->compute_partition_count(pid / m)
+               * right_->compute_partition_count(pid % m);
+    }
+
+private:
+    std::shared_ptr<vega::RDDBase> left_, right_;
+};
+
+// zipPartitions: func(iter_left, iter_right) -> iterable, per partition.
+class PyZipPartitionsRDDImpl : public vega::RDDBase {
+public:
+    PyZipPartitionsRDDImpl(std::shared_ptr<vega::RDDBase> left,
+                           std::shared_ptr<vega::RDDBase> right,
+                           py::object func)
+        : left_(std::move(left)), right_(std::move(right)), func_(std::move(func)) {
+        if (left_->num_partitions() != right_->num_partitions())
+            throw std::runtime_error(
+                "Can only zip RDDs with the same number of partitions");
+    }
+
+    bool uses_python_runtime() const override { return true; }
+    size_t num_partitions() const override { return left_->num_partitions(); }
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        return {left_, right_};
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        std::vector<py::object> out;
+        run(pid, [&](py::object item) { out.push_back(std::move(item)); });
+        return out;
+    }
+    size_t compute_partition_count(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        size_t n = 0;
+        run(pid, [&](py::object) { ++n; });
+        return n;
+    }
+
+private:
+    template<typename Fn>
+    void run(size_t pid, Fn&& fn) const {
+        py::list a = py_list_from(py_parent_partition(left_, pid));
+        py::list b = py_list_from(py_parent_partition(right_, pid));
+        py::object result = udf_call2(func_, a.attr("__iter__")(), b.attr("__iter__")());
+        udf_iterate(result, std::forward<Fn>(fn));
+    }
+
+    std::shared_ptr<vega::RDDBase> left_, right_;
+    py::object func_;
+};
+
+// partitionBy / repartition shuffle.
+//   mode 0: bucket = partitioner(key) % N for (key, value) items
+//           (partitioner None => hash(key))
+//   mode 1: round-robin by element position (repartition of any data)
+class PyPartitionByRDDImpl : public vega::RDDBase {
+public:
+    PyPartitionByRDDImpl(std::shared_ptr<vega::RDDBase> parent,
+                         size_t num_partitions,
+                         py::object partitioner,
+                         uint8_t mode)
+        : parent_(std::move(parent))
+        , num_partitions_(std::max<size_t>(1, num_partitions))
+        , partitioner_(std::move(partitioner))
+        , mode_(mode) {
+        buckets_.resize(num_partitions_);
+    }
+
+    size_t num_partitions() const override { return num_partitions_; }
+    bool is_narrow() const override { return false; }
+    bool uses_python_runtime() const override { return true; }
+    bool shuffle_ready() const override { return shuffle_ready_; }
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        return {parent_};
+    }
+
+    void prepare_shuffle(const std::vector<std::any>& parent_results) override {
+        py::gil_scoped_acquire acquire;
+        for (auto& b : buckets_) b.clear();
+        shuffle_ready_ = false;
+        const int64_t n = static_cast<int64_t>(num_partitions_);
+        for (size_t map_pid = 0; map_pid < parent_results.size(); ++map_pid) {
+            const auto* data = std::any_cast<std::vector<py::object>>(&parent_results[map_pid]);
+            if (!data)
+                throw std::runtime_error("partitionBy: unexpected map output type");
+            size_t pos = map_pid;  // round-robin start differs per map partition
+            for (const auto& item : *data) {
+                size_t bucket = 0;
+                if (mode_ == 1) {
+                    bucket = pos++ % num_partitions_;
+                } else {
+                    py::object key = item;
+                    if (PyTuple_Check(item.ptr()) && PyTuple_GET_SIZE(item.ptr()) >= 1)
+                        key = py::reinterpret_borrow<py::object>(PyTuple_GET_ITEM(item.ptr(), 0));
+                    int64_t h;
+                    if (partitioner_.is_none()) {
+                        h = static_cast<int64_t>(py_hash(key) & 0x7fffffffffffffffULL);
+                    } else {
+                        py::object r = udf_call1(partitioner_, key);
+                        h = PyLong_AsLongLong(r.ptr());
+                        if (h == -1 && PyErr_Occurred()) raise_udf_error();
+                    }
+                    bucket = static_cast<size_t>(((h % n) + n) % n);
+                }
+                buckets_[bucket].push_back(item);
+            }
+        }
+        shuffle_ready_ = true;
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        py::gil_scoped_acquire acquire;
+        if (!shuffle_ready_)
+            throw std::runtime_error("partitionBy: shuffle data not prepared");
+        return buckets_.at(pid);
+    }
+    size_t compute_partition_count(size_t pid) const override {
+        if (!shuffle_ready_)
+            throw std::runtime_error("partitionBy: shuffle data not prepared");
+        return buckets_.at(pid).size();
+    }
+
+private:
+    std::shared_ptr<vega::RDDBase> parent_;
+    size_t num_partitions_;
+    py::object partitioner_;
+    uint8_t mode_;
+    bool shuffle_ready_ = false;
+    std::vector<std::vector<py::object>> buckets_;
+};
+
+// persist()/cache(): memoizes computed partitions in server memory. Lazy --
+// partitions are stored the first time an action computes them. Once every
+// partition is cached the lineage is cut (no dependencies), so upstream
+// stages are skipped entirely.
+class CachedRDDImpl : public vega::RDDBase {
+public:
+    using Sizer = std::function<size_t(const std::any&)>;
+
+    CachedRDDImpl(std::shared_ptr<vega::RDDBase> parent, Sizer sizer)
+        : parent_(std::move(parent)), sizer_(std::move(sizer)),
+          python_(parent_->uses_python_runtime()) {
+        cache_.resize(parent_->num_partitions());
+        set_context(parent_->context());
+    }
+
+    ~CachedRDDImpl() override {
+        if (python_ && Py_IsInitialized()) {
+            py::gil_scoped_acquire acquire;
+            cache_.clear();
+        }
+    }
+
+    bool uses_python_runtime() const override { return python_; }
+    size_t num_partitions() const override { return cache_.size(); }
+    bool is_narrow() const override { return true; }
+
+    std::vector<std::shared_ptr<vega::RDDBase>> dependencies() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cached_count_ == cache_.size()) return {};
+        return {parent_};
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (cache_.at(pid).has_value()) return copy(*cache_[pid]);
+        }
+        std::any value = parent_->compute_partition(pid);
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!cache_[pid].has_value()) {
+            cache_[pid] = copy(value);
+            ++cached_count_;
+        }
+        return value;
+    }
+
+    size_t compute_partition_count(size_t pid) const override {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (cache_.at(pid).has_value()) return sizer_(*cache_[pid]);
+        }
+        if (python_) {
+            py::gil_scoped_acquire acquire;
+            return sizer_(compute_partition(pid));
+        }
+        return sizer_(compute_partition(pid));
+    }
+
+    size_t cached_partitions() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return cached_count_;
+    }
+
+private:
+    std::any copy(const std::any& v) const {
+        if (python_) {
+            py::gil_scoped_acquire acquire;
+            return std::any(v);
+        }
+        return std::any(v);
+    }
+
+    std::shared_ptr<vega::RDDBase> parent_;
+    Sizer sizer_;
+    bool python_;
+    mutable std::mutex mu_;
+    mutable std::vector<std::optional<std::any>> cache_;
+    mutable size_t cached_count_ = 0;
+};
+
+template<typename T>
+static size_t any_vec_size(const std::any& a) {
+    const auto* v = std::any_cast<std::vector<T>>(&a);
+    return v ? v->size() : 0;
+}
 
 static std::vector<std::any> execute_with_gil(vega::SparkContext* ctx,
                                               std::shared_ptr<vega::RDDBase> rdd) {
@@ -1117,14 +1524,19 @@ static size_t execute_count_with_gil(vega::SparkContext* ctx,
     return total;
 }
 
+static PyObject* cached_attr(const char* module, const char* attr);
+
+// cloudpickle output is a standard pickle stream, so the C unpickler loads
+// both stdlib- and cloudpickle-produced payloads.
 static py::object unpickle_bytes(const vega::ByteBuffer& buf) {
-    py::bytes b(std::string(reinterpret_cast<const char*>(buf.data()), buf.size()));
-    try {
-        return py::module_::import("cloudpickle").attr("loads")(b);
-    } catch (const py::error_already_set&) {
-        PyErr_Clear();
-        return py::module_::import("pickle").attr("loads")(b);
-    }
+    static PyObject* loads = cached_attr("pickle", "loads");
+    PyObject* b = PyBytes_FromStringAndSize(reinterpret_cast<const char*>(buf.data()),
+                                            static_cast<Py_ssize_t>(buf.size()));
+    if (!b) throw py::error_already_set();
+    PyObject* r = PyObject_CallOneArg(loads, b);
+    Py_DECREF(b);
+    if (!r) throw py::error_already_set();
+    return py::reinterpret_steal<py::object>(r);
 }
 
 static py::bytes pickle_dumps(const py::object& obj) {
@@ -1134,6 +1546,39 @@ static py::bytes pickle_dumps(const py::object& obj) {
         PyErr_Clear();
         return py::module_::import("pickle").attr("dumps")(obj);
     }
+}
+
+
+// Data (not code) is pickled with the C pickler first -- considerably faster
+// than cloudpickle for plain lists/tuples -- falling back to cloudpickle for
+// objects the stdlib pickler cannot handle (lambdas, local classes, ...).
+static PyObject* cached_attr(const char* module, const char* attr) {
+    PyObject* mod = PyImport_ImportModule(module);
+    if (!mod) throw py::error_already_set();
+    PyObject* fn = PyObject_GetAttrString(mod, attr);
+    Py_DECREF(mod);
+    if (!fn) throw py::error_already_set();
+    return fn;  // intentionally leaked: lives for the interpreter lifetime
+}
+
+static py::bytes pickle_data(const py::object& obj) {
+    static PyObject* dumps = cached_attr("pickle", "dumps");
+    static PyObject* protocol = PyLong_FromLong(5);
+    PyObject* args[2] = {obj.ptr(), protocol};
+    PyObject* r = PyObject_Vectorcall(dumps, args, 2, nullptr);
+    if (r) return py::reinterpret_steal<py::bytes>(r);
+    PyErr_Clear();
+    return pickle_dumps(obj);
+}
+
+static vega::ByteBuffer pickled_payload(const py::object& obj) {
+    py::bytes pickled = pickle_data(obj);
+    char* data = nullptr;
+    Py_ssize_t len = 0;
+    if (PyBytes_AsStringAndSize(pickled.ptr(), &data, &len) != 0)
+        throw py::error_already_set();
+    return vega::ByteBuffer(reinterpret_cast<const uint8_t*>(data),
+                            reinterpret_cast<const uint8_t*>(data) + len);
 }
 
 static py::object wrap_python_udf(py::object func) {
@@ -1154,6 +1599,17 @@ static py::object wrap_python_udf(py::object func) {
 
 class ServerSession {
 public:
+    enum class RddStorageKind : uint8_t {
+        Python,
+        Int64,
+        Float64,
+        String,
+        PairInt64,
+        PairDoubleInt64,
+        PairStringInt64,
+        GroupedPairInt64,
+    };
+
     explicit ServerSession(size_t num_workers)
         : ctx_(std::make_unique<vega::SparkContext>(num_workers))
     {
@@ -1161,6 +1617,16 @@ public:
             py::gil_scoped_acquire acquire;
             fn();
         };
+    }
+
+    ~ServerSession() {
+        // Stored RDDs hold py::object values: drop them with the GIL held,
+        // then stop the actor system (whose threads may need the GIL).
+        if (Py_IsInitialized()) {
+            py::gil_scoped_acquire acquire;
+            rdds_.clear();
+        }
+        ctx_.reset();  // called without the GIL: actor threads may need it
     }
 
     size_t num_workers() const { return ctx_->num_workers(); }
@@ -1338,9 +1804,242 @@ public:
             case StageOp::GroupByKey:
                 cur = group_by_key_with_func(cur, stage.num_partitions);
                 break;
+            case StageOp::MapPartitions:
+                cur = map_partitions_with_func(cur, stage.func);
+                break;
             }
         }
         return cur;
+    }
+
+    // ----- v0.6 server-side operators ---------------------------------------
+
+    uint64_t map_partitions_with_func(uint64_t parent, const py::object& func) {
+        auto impl = std::make_shared<PyMapPartitionsRDDImpl>(python_parent(parent), func);
+        impl->set_context(ctx_.get());
+        return store_python(std::move(impl));
+    }
+
+    uint64_t union_rdds(const std::vector<uint64_t>& ids) {
+        py::gil_scoped_acquire acquire;
+        std::vector<std::shared_ptr<vega::RDDBase>> parents;
+        parents.reserve(ids.size());
+        for (uint64_t id : ids)
+            parents.push_back(python_parent(id));
+        auto impl = std::make_shared<PyUnionRDDImpl>(std::move(parents));
+        return store_python(std::move(impl));
+    }
+
+    uint64_t partition_by(uint64_t parent, size_t parts, uint8_t mode,
+                          const vega::ByteBuffer& func_bytes) {
+        py::gil_scoped_acquire acquire;
+        py::object func = func_bytes.empty() ? py::none() : unpickle(func_bytes);
+        if (parts == 0)
+            parts = load_entry(parent).impl->num_partitions();
+        auto impl = std::make_shared<PyPartitionByRDDImpl>(
+            python_parent(parent), parts, std::move(func), mode);
+        return store_python(std::move(impl));
+    }
+
+    uint64_t coalesce(uint64_t parent, std::vector<std::vector<size_t>> groups) {
+        py::gil_scoped_acquire acquire;
+        auto base = python_parent(parent);
+        for (const auto& g : groups)
+            for (size_t p : g)
+                if (p >= base->num_partitions())
+                    throw std::runtime_error("coalesce: partition index out of range");
+        auto impl = std::make_shared<PyCoalescedRDDImpl>(std::move(base), std::move(groups));
+        return store_python(std::move(impl));
+    }
+
+    uint64_t cartesian(uint64_t left, uint64_t right) {
+        py::gil_scoped_acquire acquire;
+        auto impl = std::make_shared<PyCartesianRDDImpl>(python_parent(left),
+                                                         python_parent(right));
+        return store_python(std::move(impl));
+    }
+
+    uint64_t zip_partitions(uint64_t left, uint64_t right, const vega::ByteBuffer& func_bytes) {
+        py::gil_scoped_acquire acquire;
+        auto impl = std::make_shared<PyZipPartitionsRDDImpl>(
+            python_parent(left), python_parent(right), unpickle(func_bytes));
+        return store_python(std::move(impl));
+    }
+
+    uint64_t persist(uint64_t id) {
+        auto& entry = load_entry(id);
+        CachedRDDImpl::Sizer sizer;
+        switch (entry.kind) {
+        case RddStorageKind::Python: sizer = any_vec_size<py::object>; break;
+        case RddStorageKind::Int64: sizer = any_vec_size<int64_t>; break;
+        case RddStorageKind::Float64: sizer = any_vec_size<double>; break;
+        case RddStorageKind::String: sizer = any_vec_size<std::string>; break;
+        case RddStorageKind::PairInt64:
+            sizer = any_vec_size<std::pair<int64_t, int64_t>>; break;
+        case RddStorageKind::PairDoubleInt64:
+            sizer = any_vec_size<std::pair<double, int64_t>>; break;
+        case RddStorageKind::PairStringInt64:
+            sizer = any_vec_size<std::pair<std::string, int64_t>>; break;
+        case RddStorageKind::GroupedPairInt64:
+            sizer = any_vec_size<std::pair<int64_t, std::vector<int64_t>>>; break;
+        }
+        const auto kind = entry.kind;
+        auto impl = std::make_shared<CachedRDDImpl>(entry.impl, std::move(sizer));
+        return store(kind, std::move(impl));
+    }
+
+    void release(const std::vector<uint64_t>& ids) {
+        py::gil_scoped_acquire acquire;
+        for (uint64_t id : ids)
+            rdds_.erase(id);
+    }
+
+    // Run per-partition jobs over a subset of partitions.
+    //   mode 0: list of per-partition element lists
+    //   mode 1: list of per-partition counts
+    py::list run_job(uint64_t id, std::vector<size_t> pids, uint8_t mode) {
+        auto& entry = load_entry(id);
+        const size_t total = entry.impl->num_partitions();
+        for (size_t pid : pids)
+            if (pid >= total)
+                throw std::runtime_error("runJob: partition index out of range");
+        py::gil_scoped_acquire acquire;
+        py::list out;
+        if (pids.empty()) return out;
+        if (mode == 1) {
+            std::vector<size_t> counts;
+            {
+                py::gil_scoped_release release;
+                counts = ctx_->execute_count_partitions(entry.impl, std::move(pids));
+            }
+            for (size_t c : counts) out.append(c);
+            return out;
+        }
+        std::vector<std::any> results;
+        {
+            py::gil_scoped_release release;
+            results = ctx_->execute_partitions(entry.impl, std::move(pids));
+        }
+        for (auto& part : results)
+            out.append(partition_to_list(entry.kind, part));
+        results.clear();
+        return out;
+    }
+
+    // Exact numeric statistics computed natively for int64/float64 RDDs.
+    // Returns None for other storage kinds so the client can fall back.
+    py::object native_stats(uint64_t id) {
+        auto& entry = load_entry(id);
+        py::gil_scoped_acquire acquire;
+        if (entry.kind != RddStorageKind::Int64 && entry.kind != RddStorageKind::Float64)
+            return py::none();
+        std::vector<std::any> results;
+        {
+            py::gil_scoped_release release;
+            results = ctx_->execute(entry.impl);
+        }
+        uint64_t n = 0;
+        double mean = 0.0, m2 = 0.0;
+        auto welford = [&](double x) {
+            ++n;
+            const double delta = x - mean;
+            mean += delta / static_cast<double>(n);
+            m2 += delta * (x - mean);
+        };
+        if (entry.kind == RddStorageKind::Int64) {
+            __int128 sum = 0;
+            int64_t mn = 0, mx = 0;
+            for (auto& r : results) {
+                const auto& vec = *std::any_cast<std::vector<int64_t>>(&r);
+                for (int64_t v : vec) {
+                    if (n == 0) { mn = mx = v; }
+                    mn = std::min(mn, v);
+                    mx = std::max(mx, v);
+                    sum += v;
+                    welford(static_cast<double>(v));
+                }
+            }
+            // __int128 -> Python int via decimal string.
+            const bool neg = sum < 0;
+            unsigned __int128 mag = neg ? static_cast<unsigned __int128>(-sum)
+                                        : static_cast<unsigned __int128>(sum);
+            std::string digits;
+            do { digits.push_back(static_cast<char>('0' + static_cast<int>(mag % 10))); mag /= 10; } while (mag);
+            if (neg) digits.push_back('-');
+            std::reverse(digits.begin(), digits.end());
+            py::object py_sum = py::reinterpret_steal<py::object>(
+                PyLong_FromString(digits.c_str(), nullptr, 10));
+            if (n == 0) return py::make_tuple(0, 0, py::none(), py::none(), 0.0);
+            return py::make_tuple(n, py_sum, mn, mx, m2);
+        }
+        double sum = 0.0;
+        double mn = 0.0, mx = 0.0;
+        for (auto& r : results) {
+            const auto& vec = *std::any_cast<std::vector<double>>(&r);
+            for (double v : vec) {
+                if (n == 0) { mn = mx = v; }
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+                sum += v;
+                welford(v);
+            }
+        }
+        if (n == 0) return py::make_tuple(0, 0.0, py::none(), py::none(), 0.0);
+        return py::make_tuple(n, sum, mn, mx, m2);
+    }
+
+    py::tuple describe(uint64_t id) {
+        auto& entry = load_entry(id);
+        py::gil_scoped_acquire acquire;
+        static const char* names[] = {"python", "int64", "float64", "str",
+                                      "pair<int64,int64>", "pair<float64,int64>",
+                                      "pair<str,int64>", "pair<int64,list<int64>>"};
+        long cached = -1;
+        if (auto* c = dynamic_cast<CachedRDDImpl*>(entry.impl.get()))
+            cached = static_cast<long>(c->cached_partitions());
+        return py::make_tuple(names[static_cast<int>(entry.kind)],
+                              entry.impl->num_partitions(), cached);
+    }
+
+    // Convert one computed partition of the given storage kind to a list.
+    // Caller must hold the GIL.
+    static py::list partition_to_list(RddStorageKind kind, std::any& part) {
+        py::list output;
+        switch (kind) {
+        case RddStorageKind::Python:
+            return py_list_from(std::move(py_vec_ref(part)));
+        case RddStorageKind::Int64:
+            for (int64_t v : *std::any_cast<std::vector<int64_t>>(&part)) output.append(v);
+            break;
+        case RddStorageKind::Float64:
+            for (double v : *std::any_cast<std::vector<double>>(&part)) output.append(v);
+            break;
+        case RddStorageKind::String:
+            for (const auto& v : *std::any_cast<std::vector<std::string>>(&part))
+                output.append(py::str(v));
+            break;
+        case RddStorageKind::PairInt64:
+            for (auto& [k, v] : *std::any_cast<std::vector<std::pair<int64_t, int64_t>>>(&part))
+                output.append(py::make_tuple(k, v));
+            break;
+        case RddStorageKind::PairDoubleInt64:
+            for (auto& [k, v] : *std::any_cast<std::vector<std::pair<double, int64_t>>>(&part))
+                output.append(py::make_tuple(k, v));
+            break;
+        case RddStorageKind::PairStringInt64:
+            for (auto& [k, v] : *std::any_cast<std::vector<std::pair<std::string, int64_t>>>(&part))
+                output.append(py::make_tuple(py::str(k), v));
+            break;
+        case RddStorageKind::GroupedPairInt64:
+            for (auto& [k, vs] : *std::any_cast<
+                     std::vector<std::pair<int64_t, std::vector<int64_t>>>>(&part)) {
+                py::list lst;
+                for (int64_t v : vs) lst.append(v);
+                output.append(py::make_tuple(k, lst));
+            }
+            break;
+        }
+        return output;
     }
 
     vega::ByteBuffer execute(uint64_t base_id,
@@ -1360,7 +2059,7 @@ public:
         case ActionOp::Collect: {
             py::list data = collect(rdd_id);
             py::gil_scoped_acquire acquire;
-            py::bytes pickled = pickle_dumps(data);
+            py::bytes pickled = pickle_data(data);
             std::string s = pickled;
             vega::ByteBuffer payload(
                 reinterpret_cast<const uint8_t*>(s.data()),
@@ -1373,7 +2072,7 @@ public:
         case ActionOp::Reduce: {
             py::object value = reduce(rdd_id, action_func_bytes);
             py::gil_scoped_acquire acquire;
-            py::bytes out = pickle_dumps(value);
+            py::bytes out = pickle_data(value);
             std::string s = out;
             vega::ByteBuffer payload(
                 reinterpret_cast<const uint8_t*>(s.data()),
@@ -1511,84 +2210,16 @@ public:
     }
 
     py::list collect_partition(uint64_t rdd_id, size_t pid) {
-        auto& entry = load_entry(rdd_id);
-        py::list output;
-        if (entry.kind == RddStorageKind::Python) {
-            py::gil_scoped_acquire acquire;
-            auto vec = py_parent_partition(entry.impl, pid);
-            for (auto& obj : vec)
-                output.append(std::move(obj));
-            return output;
-        }
-
-        std::any part;
-        if (entry.kind == RddStorageKind::Int64
-            || entry.kind == RddStorageKind::Float64
-            || entry.kind == RddStorageKind::String
-            || entry.kind == RddStorageKind::PairInt64
-            || entry.kind == RddStorageKind::PairDoubleInt64
-            || entry.kind == RddStorageKind::GroupedPairInt64) {
-            part = entry.impl->compute_partition(pid);
-        } else {
-            py::gil_scoped_release release;
-            part = entry.impl->compute_partition(pid);
-        }
-
         py::gil_scoped_acquire acquire;
-        if (entry.kind == RddStorageKind::Int64) {
-            auto vec = std::any_cast<std::vector<int64_t>>(part);
-            for (int64_t v : vec)
-                output.append(v);
-            return output;
-        }
-        if (entry.kind == RddStorageKind::Float64) {
-            auto vec = std::any_cast<std::vector<double>>(part);
-            for (double v : vec)
-                output.append(v);
-            return output;
-        }
-        if (entry.kind == RddStorageKind::String) {
-            auto vec = std::any_cast<std::vector<std::string>>(part);
-            for (const auto& s : vec)
-                output.append(py::str(s));
-            return output;
-        }
-        if (entry.kind == RddStorageKind::PairInt64) {
-            auto vec = std::any_cast<std::vector<std::pair<int64_t, int64_t>>>(part);
-            for (auto& [k, v] : vec)
-                output.append(py::make_tuple(k, v));
-            return output;
-        }
-        if (entry.kind == RddStorageKind::PairDoubleInt64) {
-            auto vec = std::any_cast<std::vector<std::pair<double, int64_t>>>(part);
-            for (auto& [k, v] : vec)
-                output.append(py::make_tuple(k, v));
-            return output;
-        }
-        if (entry.kind == RddStorageKind::GroupedPairInt64) {
-            auto vec = std::any_cast<
-                std::vector<std::pair<int64_t, std::vector<int64_t>>>>(part);
-            for (auto& [k, vs] : vec) {
-                py::list lst;
-                for (int64_t v : vs)
-                    lst.append(v);
-                output.append(py::make_tuple(k, lst));
-            }
-            return output;
-        }
-        auto vec = std::any_cast<std::vector<std::pair<std::string, int64_t>>>(part);
-        for (auto& [k, v] : vec)
-            output.append(py::make_tuple(py::str(k), v));
-        return output;
+        py::list parts = run_job(rdd_id, {pid}, 0);
+        return py::reinterpret_borrow<py::list>(parts[0]);
     }
 
     py::list collect_partitions(uint64_t rdd_id) {
-        auto& entry = load_entry(rdd_id);
-        const size_t parts = entry.impl->num_partitions();
-        py::list output;
-        for (size_t i = 0; i < parts; ++i)
-            output.append(collect_partition(rdd_id, i));
-        return output;
+        const size_t parts = load_entry(rdd_id).impl->num_partitions();
+        std::vector<size_t> pids(parts);
+        for (size_t i = 0; i < parts; ++i) pids[i] = i;
+        return run_job(rdd_id, std::move(pids), 0);
     }
 
     uint64_t parallelize_partitions(const vega::ByteBuffer& pickled) {
@@ -1751,16 +2382,6 @@ public:
     }
 
 private:
-    enum class RddStorageKind : uint8_t {
-        Python,
-        Int64,
-        Float64,
-        String,
-        PairInt64,
-        PairDoubleInt64,
-        PairStringInt64,
-        GroupedPairInt64,
-    };
 
     struct StoredRdd {
         RddStorageKind kind;
@@ -2126,22 +2747,19 @@ private:
     }
 
     uint64_t map_with_func(uint64_t parent, const py::object& func) {
-        auto impl = std::make_shared<PyMappedRDDImpl>(
-            python_parent(parent), wrap_python_udf(func));
+        auto impl = std::make_shared<PyMappedRDDImpl>(python_parent(parent), func);
         impl->set_context(ctx_.get());
         return store_python(std::move(impl));
     }
 
     uint64_t filter_with_func(uint64_t parent, const py::object& func) {
-        auto impl = std::make_shared<PyFilteredRDDImpl>(
-            python_parent(parent), wrap_python_udf(func));
+        auto impl = std::make_shared<PyFilteredRDDImpl>(python_parent(parent), func);
         impl->set_context(ctx_.get());
         return store_python(std::move(impl));
     }
 
     uint64_t flat_map_with_func(uint64_t parent, const py::object& func) {
-        auto impl = std::make_shared<PyFlatMappedRDDImpl>(
-            python_parent(parent), wrap_python_udf(func));
+        auto impl = std::make_shared<PyFlatMappedRDDImpl>(python_parent(parent), func);
         impl->set_context(ctx_.get());
         return store_python(std::move(impl));
     }
@@ -2149,7 +2767,7 @@ private:
     uint64_t reduce_by_key_with_func(uint64_t parent, const py::object& func,
                                      size_t num_partitions) {
         auto impl = std::make_shared<PyReduceByKeyRDDImpl>(
-            python_parent(parent), wrap_python_udf(func), num_partitions);
+            python_parent(parent), func, num_partitions);
         impl->set_context(ctx_.get());
         return store_python(std::move(impl));
     }
@@ -2258,6 +2876,14 @@ static vega::ByteBuffer send_error(const std::string& msg) {
     return vega::client::encode(vega::client::MsgType::Error, body);
 }
 
+static vega::ByteBuffer id_ack(const ServerSession& session,
+                               vega::client::MsgType type, uint64_t id) {
+    vega::ByteBuffer ack;
+    vega::write_pod<uint64_t>(ack, id);
+    vega::write_pod<uint32_t>(ack, static_cast<uint32_t>(session.num_partitions(id)));
+    return vega::client::encode(type, ack);
+}
+
 static void handle_client(std::unique_ptr<vega::net::TcpConnection> conn) {
     std::unique_ptr<ServerSession> session;
 
@@ -2278,6 +2904,8 @@ static void handle_client(std::unique_ptr<vega::net::TcpConnection> conn) {
                 vega::ByteBuffer ack;
                 vega::write_pod<uint32_t>(
                     ack, static_cast<uint32_t>(session->num_workers()));
+                // Protocol revision (older clients ignore trailing bytes).
+                vega::write_pod<uint32_t>(ack, kProtocolVersion);
                 reply = vega::client::encode(vega::client::MsgType::HelloAck, ack);
                 break;
             }
@@ -2354,7 +2982,7 @@ static void handle_client(std::unique_ptr<vega::net::TcpConnection> conn) {
                 uint64_t id = vega::read_pod<uint64_t>(body, off);
                 py::gil_scoped_acquire acquire;
                 py::list data = session->collect(id, true);
-                py::bytes pickled = pickle_dumps(data);
+                py::bytes pickled = pickle_data(data);
                 std::string s = pickled;
                 vega::ByteBuffer ack(
                     reinterpret_cast<const uint8_t*>(s.data()),
@@ -2367,7 +2995,7 @@ static void handle_client(std::unique_ptr<vega::net::TcpConnection> conn) {
                 uint64_t id = vega::read_pod<uint64_t>(body, off);
                 py::gil_scoped_acquire acquire;
                 py::list data = session->collect_partitions(id);
-                py::bytes pickled = pickle_dumps(data);
+                py::bytes pickled = pickle_data(data);
                 std::string s = pickled;
                 vega::ByteBuffer ack(
                     reinterpret_cast<const uint8_t*>(s.data()),
@@ -2382,7 +3010,7 @@ static void handle_client(std::unique_ptr<vega::net::TcpConnection> conn) {
                 uint32_t pid = vega::read_pod<uint32_t>(body, off);
                 py::gil_scoped_acquire acquire;
                 py::list data = session->collect_partition(id, pid);
-                py::bytes pickled = pickle_dumps(data);
+                py::bytes pickled = pickle_data(data);
                 std::string s = pickled;
                 vega::ByteBuffer ack(
                     reinterpret_cast<const uint8_t*>(s.data()),
@@ -2409,7 +3037,7 @@ static void handle_client(std::unique_ptr<vega::net::TcpConnection> conn) {
                 auto pickled = vega::client::read_bytes(body, off);
                 py::gil_scoped_acquire acquire;
                 py::object value = session->reduce(id, pickled);
-                py::bytes out = pickle_dumps(value);
+                py::bytes out = pickle_data(value);
                 std::string s = out;
                 vega::ByteBuffer ack(
                     reinterpret_cast<const uint8_t*>(s.data()),
@@ -2481,6 +3109,127 @@ static void handle_client(std::unique_ptr<vega::net::TcpConnection> conn) {
                 auto pickled = vega::client::read_bytes(body, off);
                 session->foreach(id, pickled);
                 reply = vega::client::encode(vega::client::MsgType::ForeachAck, {});
+                break;
+            }
+            case vega::client::MsgType::ApplyStages: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t base = vega::read_pod<uint64_t>(body, off);
+                auto stages = parse_stages(body, off);
+                uint64_t id = session->apply_stages_id(base, stages);
+                {
+                    py::gil_scoped_acquire acquire;
+                    stages.clear();
+                }
+                reply = id_ack(*session, vega::client::MsgType::ApplyStagesAck, id);
+                break;
+            }
+            case vega::client::MsgType::Union: {
+                if (!session) throw std::runtime_error("session not initialized");
+                const uint32_t n = vega::read_pod<uint32_t>(body, off);
+                std::vector<uint64_t> ids(n);
+                for (auto& id : ids) id = vega::read_pod<uint64_t>(body, off);
+                reply = id_ack(*session, vega::client::MsgType::UnionAck,
+                               session->union_rdds(ids));
+                break;
+            }
+            case vega::client::MsgType::PartitionBy: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t parent = vega::read_pod<uint64_t>(body, off);
+                uint32_t parts = vega::read_pod<uint32_t>(body, off);
+                uint8_t mode = vega::read_pod<uint8_t>(body, off);
+                auto func = vega::client::read_bytes(body, off);
+                reply = id_ack(*session, vega::client::MsgType::PartitionByAck,
+                               session->partition_by(parent, parts, mode, func));
+                break;
+            }
+            case vega::client::MsgType::Coalesce: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t parent = vega::read_pod<uint64_t>(body, off);
+                const uint32_t ngroups = vega::read_pod<uint32_t>(body, off);
+                std::vector<std::vector<size_t>> groups(ngroups);
+                for (auto& g : groups) {
+                    const uint32_t k = vega::read_pod<uint32_t>(body, off);
+                    g.resize(k);
+                    for (auto& p : g) p = vega::read_pod<uint32_t>(body, off);
+                }
+                reply = id_ack(*session, vega::client::MsgType::CoalesceAck,
+                               session->coalesce(parent, std::move(groups)));
+                break;
+            }
+            case vega::client::MsgType::Cartesian: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t left = vega::read_pod<uint64_t>(body, off);
+                uint64_t right = vega::read_pod<uint64_t>(body, off);
+                reply = id_ack(*session, vega::client::MsgType::CartesianAck,
+                               session->cartesian(left, right));
+                break;
+            }
+            case vega::client::MsgType::ZipPartitions: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t left = vega::read_pod<uint64_t>(body, off);
+                uint64_t right = vega::read_pod<uint64_t>(body, off);
+                auto func = vega::client::read_bytes(body, off);
+                reply = id_ack(*session, vega::client::MsgType::ZipPartitionsAck,
+                               session->zip_partitions(left, right, func));
+                break;
+            }
+            case vega::client::MsgType::Persist: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t id = vega::read_pod<uint64_t>(body, off);
+                reply = id_ack(*session, vega::client::MsgType::PersistAck,
+                               session->persist(id));
+                break;
+            }
+            case vega::client::MsgType::Release: {
+                if (!session) throw std::runtime_error("session not initialized");
+                const uint32_t n = vega::read_pod<uint32_t>(body, off);
+                std::vector<uint64_t> ids(n);
+                for (auto& id : ids) id = vega::read_pod<uint64_t>(body, off);
+                session->release(ids);
+                reply = vega::client::encode(vega::client::MsgType::ReleaseAck, {});
+                break;
+            }
+            case vega::client::MsgType::RunPython: {
+                if (!session) throw std::runtime_error("session not initialized");
+                auto pickled = vega::client::read_bytes(body, off);
+                py::gil_scoped_acquire acquire;
+                py::tuple call = py::reinterpret_borrow<py::tuple>(unpickle_bytes(pickled));
+                py::object func = call[0];
+                py::tuple args = py::reinterpret_borrow<py::tuple>(call[1]);
+                py::object result = func(*args);
+                reply = vega::client::encode(vega::client::MsgType::RunPythonAck,
+                                             pickled_payload(result));
+                break;
+            }
+            case vega::client::MsgType::RunJob: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t id = vega::read_pod<uint64_t>(body, off);
+                const uint32_t n = vega::read_pod<uint32_t>(body, off);
+                std::vector<size_t> pids(n);
+                for (auto& p : pids) p = vega::read_pod<uint32_t>(body, off);
+                uint8_t mode = vega::read_pod<uint8_t>(body, off);
+                py::gil_scoped_acquire acquire;
+                py::list data = session->run_job(id, std::move(pids), mode);
+                reply = vega::client::encode(vega::client::MsgType::RunJobAck,
+                                             pickled_payload(data));
+                break;
+            }
+            case vega::client::MsgType::NativeStats: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t id = vega::read_pod<uint64_t>(body, off);
+                py::gil_scoped_acquire acquire;
+                py::object stats = session->native_stats(id);
+                reply = vega::client::encode(vega::client::MsgType::NativeStatsAck,
+                                             pickled_payload(stats));
+                break;
+            }
+            case vega::client::MsgType::Describe: {
+                if (!session) throw std::runtime_error("session not initialized");
+                uint64_t id = vega::read_pod<uint64_t>(body, off);
+                py::gil_scoped_acquire acquire;
+                py::tuple info = session->describe(id);
+                reply = vega::client::encode(vega::client::MsgType::DescribeAck,
+                                             pickled_payload(info));
                 break;
             }
             default:

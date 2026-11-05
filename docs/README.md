@@ -13,15 +13,16 @@ lazily until an action runs.
 | [Python RDD guide](python-guide.md) | PyVega API, transformations, actions, I/O |
 | [PySpark compatibility](pyspark-compat.md) | Run PySpark-style code and upstream RDD tests |
 | [DataFrame-style operations](dataframe-operations.md) | RDD equivalents for common SQL/DataFrame patterns |
+| [Vega extras](vega-extras.md) | Operations beyond Spark's RDD API |
+| [Releasing](releasing.md) | Wheels, PyPI trusted publishing, release checklist |
 
 ## Quick reference
 
 ```bash
-# Build the session server (required for Python)
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DVEGA_BUILD_SERVER=ON
-cmake --build build-release --target vega_server -j$(nproc)
+# Install PyVega (prebuilt wheel with the C++ server inside)
+pip install pyvega
 
-# Install PyVega
+# ...or from a source checkout (compiles the server extension)
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[test]"
 
@@ -32,7 +33,7 @@ python -c "from pyvega import SparkContext; \
 
 ```bash
 # Or start the server manually
-VEGA_SERVER=build-release/vega_server vega-server --bind 127.0.0.1:9500 --print-listening
+vega-server --bind 127.0.0.1:9500 --print-listening
 
 # Connect from Python
 python -c "from pyvega import SparkContext; \

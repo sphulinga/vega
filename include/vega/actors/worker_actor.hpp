@@ -58,6 +58,9 @@ private:
                         std::move(result),
                         {},
                     });
+                    // Drop our lineage reference while holding the GIL: it
+                    // may be the last owner of objects holding py::object.
+                    task.rdd.reset();
                 });
                 return;
             }
@@ -79,6 +82,8 @@ private:
         } catch (const std::exception& e) {
             send_task_error(task, e.what());
         }
+        if (task.rdd)
+            run_with_python_gil([&]() { task.rdd.reset(); });
     }
 };
 

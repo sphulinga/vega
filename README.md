@@ -19,19 +19,18 @@ Python UDF support.
 | [Python RDD guide](docs/python-guide.md) | PyVega API reference with examples |
 | [DataFrame-style operations](docs/dataframe-operations.md) | SQL-like patterns using RDDs |
 | [PySpark compatibility](docs/pyspark-compat.md) | Run PySpark RDD code and upstream tests |
+| [Vega extras](docs/vega-extras.md) | Operations beyond Spark's RDD API |
+| [Releasing](docs/releasing.md) | Building wheels and publishing to PyPI |
 
 ## Quick start (Python)
 
 ```bash
-# Build session server
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVEGA_BUILD_SERVER=ON
-cmake --build build --target vega_server -j$(nproc)
-
-# Install client
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[test]"
-export VEGA_SERVER="$PWD/build/vega_server"
+pip install pyvega
 ```
+
+Wheels for Linux (x86_64, aarch64) and macOS (arm64, x86_64), CPython 3.9-3.13,
+include the compiled C++ server, so there is nothing else to build. From a source
+checkout, `pip install .` compiles it (needs CMake >= 3.16 and a C++17 compiler).
 
 ```python
 from pyvega import SparkContext
@@ -43,6 +42,48 @@ with SparkContext(4) as sc:
 
 **Manual server:** `vega-server --bind 127.0.0.1:9500` then
 `SparkContext(remote="127.0.0.1:9500")`. See [server and clients](docs/server-and-workers.md).
+
+## Performance
+
+Measured with [`benchmarks/bench_pyvega_ops.py`](benchmarks/bench_pyvega_ops.py)
+(best of 3, Linux, 4 cores, 4 workers):
+
+| Operation (200k elements, 4 workers) | v0.5.0 (ms) | v0.6.0 (ms) | Speedup |
+|---|---:|---:|---:|
+| parallelize+collect (tuples) | 207.7 | 139.9 | 1.5x |
+| map+filter python (tuples) | 184.6 | 45.3 | 4.1x |
+| reduceByKey (tuples) | 107.8 | 16.5 | 6.5x |
+| groupByKey (tuples) | 107.9 | 12.3 | 8.8x |
+| distinct (strings) | 4092.0 | 62.5 | 65x |
+| sortByKey (tuples) | 688.0 | 81.5 | 8.4x |
+| mapPartitions | 207.8 | 8.7 | 24x |
+| union x2 | 408.0 | 0.4 | 949x |
+| repartition(16) | 232.0 | 3.9 | 60x |
+| aggregateByKey | 172.0 | 29.4 | 5.8x |
+| take(10) | 142.2 | 1.6 | 89x |
+| first() | 148.5 | 1.5 | 98x |
+| sum (ints) | 123.9 | 1.8 | 68x |
+| aggregate | 72.5 | 32.7 | 2.2x |
+| chained shuffle | failed | 33.2 | fixed |
+
+Where the gains come from:
+
+- **Everything runs on the server.** `distinct`, `union`, `partitionBy`,
+  `repartition`, `coalesce`, `sortByKey`, `mapPartitions`, `zip`, `cartesian`,
+  joins, sampling and file I/O used to pull data back into the client and
+  re-upload it. They are now server-side operators.
+- **No 40 ms stall per RPC.** Server sockets use `TCP_NODELAY` and send each
+  frame with one `sendmsg` call. Before, Nagle's algorithm plus delayed ACKs
+  added about 44 ms to every request.
+- **Partial jobs.** `take`/`first`/`isEmpty` scan only as many partitions as
+  needed, and `toLocalIterator` computes one partition at a time.
+- **Multi-stage DAG with shuffle reuse.** Chained shuffles work, and a
+  materialized shuffle is reused by later actions (Spark's skipped stages).
+- **Map-side combine** for `reduceByKey`/`combineByKey`/`aggregateByKey`.
+- **Cheaper UDF calls.** Python functions are invoked through the C API
+  (vectorcall) without a wrapper frame, and data is pickled with the C pickler.
+- **Native numeric actions.** `sum`/`mean`/`stats`/`max`/`min` on int/float RDDs
+  run in C++ (integer sums are exact, using 128-bit accumulators).
 
 > **Note:** PyVega provides **RDD** APIs, not Spark SQL DataFrames. See
 > [DataFrame-style operations](docs/dataframe-operations.md) for RDD equivalents.
@@ -169,20 +210,18 @@ int main() {
 
 ### Available operations
 
-| Transformation | Python | C++ |
-|----------------|--------|-----|
-| `map` | `rdd.map(func)` | `rdd.map(func)` |
-| `filter` | `rdd.filter(func)` | `rdd.filter(pred)` |
-| `flat_map` | `rdd.flat_map(func)` | `rdd.flatMap(func)` |
-| `reduceByKey` | `rdd.reduce_by_key(func)` | `rdd.reduceByKey(func)` |
-| `groupByKey` | `rdd.group_by_key()` | `rdd.groupByKey()` |
+The C++ API covers `map`, `filter`, `flatMap`, `reduceByKey`, `groupByKey`
+and the `collect` / `count` / `reduce` / `foreach` actions.
 
-| Action | Python | C++ |
-|--------|--------|-----|
-| `collect` | `rdd.collect()` | `rdd.collect()` |
-| `count` | `rdd.count()` | `rdd.count()` |
-| `reduce` | `rdd.reduce(func)` | `rdd.reduce(func)` |
-| `foreach` | `rdd.foreach(func)` | `rdd.foreach(func)` |
+PyVega implements the PySpark RDD API: element-wise and partition
+transformations, all key/value operations (`reduceByKey`, `combineByKey`,
+`aggregateByKey`, `groupByKey`, `join` and the outer joins, `cogroup`,
+`subtractByKey`), set operations, `sortBy`/`sortByKey`, sampling, numeric
+actions (`stats`, `mean`, `stdev`, `histogram`, ...), approximate actions,
+`cache`/`persist`, accumulators, broadcast variables and file I/O. See the
+[Python RDD guide](docs/python-guide.md), and [Vega extras](docs/vega-extras.md)
+for operations Spark does not have (`explain`, `map_batches`, `quantiles`,
+`heavy_hitters`, `sliding`, ...).
 
 ## Project structure
 
@@ -199,6 +238,7 @@ vega/
     vega_server.cpp          TCP session server (PyVega backend)
     server_session.cpp       Session RPC + embedded Python UDFs
     vega_worker.cpp          Cluster peer daemon
+  src/server_module.cpp      Server as a Python extension (shipped in wheels)
   python/pyvega/             PyVega client package
   scripts/
     pyspark_compat/          PySpark RDD API shim
@@ -215,7 +255,7 @@ vega/
 cmake --build build --target test_spark_rdd_suite
 cd build && ctest -R SparkRDDSuite --output-on-failure
 
-# Upstream PySpark RDD tests (50/54 pass; 4 require JVM)
+# Upstream PySpark RDD tests (53/57 pass; 4 require a JVM)
 VEGA_SERVER=build/vega_server \
   python scripts/run_pyspark_tests.py --filter pyspark.tests.test_rdd
 ```
@@ -230,7 +270,8 @@ See [PySpark compatibility](docs/pyspark-compat.md).
 2. First action sends fused stages over TCP
 3. Server materializes lineage and submits a job to JobActor
 4. WorkerActors compute partitions (native C++ or embedded Python)
-5. Shuffle stages (`reduceByKey`, `groupByKey`) run as multi-stage DAGs
+5. Shuffles run as multi-stage DAGs (any number of chained shuffles), and a
+   shuffle's materialized output is reused by later actions
 6. Results return to the Python client
 
 ### Multi-node C++ cluster

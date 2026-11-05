@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <any>
 #include <future>
 #include <unordered_map>
@@ -45,6 +46,7 @@ private:
         std::shared_ptr<std::promise<std::vector<std::any>>> promise;
         msg::JobAction action = msg::JobAction::COMPUTE_PARTITION;
         msg::JobAction current_task_action = msg::JobAction::COMPUTE_PARTITION;
+        std::vector<size_t> partitions;  // final-stage subset (empty = all)
     };
     std::unordered_map<size_t, JobState> jobs_;
 
@@ -77,20 +79,41 @@ private:
         }
     }
 
+    static std::vector<std::any> final_results(JobState& state) {
+        if (state.partitions.empty())
+            return std::move(state.results);
+        std::vector<std::any> out;
+        out.reserve(state.partitions.size());
+        for (size_t pid : state.partitions)
+            out.push_back(std::move(state.results.at(pid)));
+        return out;
+    }
+
     static void fulfill_promise(JobState& state) {
         if (compute_results_need_python_gil(state)) {
             run_with_python_gil([&]() {
-                state.promise->set_value(std::move(state.results));
+                state.promise->set_value(final_results(state));
+                state.results.clear();
             });
         } else {
-            state.promise->set_value(std::move(state.results));
+            state.promise->set_value(final_results(state));
         }
     }
 
+    // Destroy a job's state; partial results may contain py::object values,
+    // which must be released while holding the GIL.
+    // The plan's RDD references may be the last owners of Python-backed
+    // RDDs, so in embedded-Python mode the state is destroyed under the GIL.
+    void erase_job(std::unordered_map<size_t, JobState>::iterator it) {
+        run_with_python_gil([&]() { jobs_.erase(it); });
+    }
+
     void handle_submit(msg::SubmitJob& job) {
-        auto plan = DAGBuilder::build(job.job_id, job.rdd);
+        auto plan = DAGBuilder::build(job.job_id, job.rdd, job.partitions);
+        run_with_python_gil([&]() { job.rdd.reset(); });  // plan holds its own refs
 
         JobState state;
+        state.partitions = job.partitions;
         state.plan = std::move(plan);
         state.promise = std::move(job.promise);
         state.current_stage = 0;
@@ -108,13 +131,19 @@ private:
 
     void handle_result(msg::TaskResult& res) {
         auto it = jobs_.find(res.job_id);
-        if (it == jobs_.end()) return;
+        if (it == jobs_.end()) {
+            // Late result for a job that already failed: the payload may hold
+            // Python objects, so drop it under the GIL.
+            if (res.data.has_value())
+                run_with_python_gil([&]() { res.data.reset(); });
+            return;
+        }
         auto& state = it->second;
 
         if (!res.error.empty()) {
             state.promise->set_exception(
                 std::make_exception_ptr(std::runtime_error(res.error)));
-            jobs_.erase(it);
+            erase_job(it);
             return;
         }
 
@@ -134,7 +163,7 @@ private:
                 }
             } catch (const std::exception& e) {
                 state.promise->set_exception(std::current_exception());
-                jobs_.erase(it);
+                erase_job(it);
                 return;
             }
         }
@@ -157,7 +186,7 @@ private:
                     }
                 } catch (const std::exception& e) {
                     state.promise->set_exception(std::current_exception());
-                    jobs_.erase(it);
+                    erase_job(it);
                     return;
                 }
             }
@@ -167,7 +196,7 @@ private:
             launch_current_stage(res.job_id);
         } else {
             fulfill_promise(state);
-            jobs_.erase(it);
+            erase_job(it);
         }
     }
 
@@ -186,7 +215,11 @@ private:
         }
 
         state.expected = stage.tasks.size();
-        state.results.resize(state.expected);
+        // Results are indexed by partition id; a partition-subset final stage
+        // still needs room for every id.
+        state.results.resize(std::max(state.expected,
+                                      stage.final_rdd ? stage.final_rdd->num_partitions()
+                                                      : state.expected));
         state.current_task_action = task_action;
 
         if (state.expected == 0) {
@@ -207,7 +240,7 @@ private:
                 launch_current_stage(job_id);
             } else {
                 fulfill_promise(state);
-                jobs_.erase(job_id);
+                erase_job(jobs_.find(job_id));
             }
             return;
         }

@@ -111,3 +111,74 @@ def histogram_partition(
 ) -> list[int]:
     _, counts = histogram_values(iterator, buckets)
     return counts
+
+
+# ---------------------------------------------------------------------------
+# HyperLogLog (used by countApproxDistinct)
+# ---------------------------------------------------------------------------
+
+_MASK64 = (1 << 64) - 1
+
+
+def _mix64(x: int) -> int:
+    """SplitMix64 finalizer: spreads Python's (often identity) hashes."""
+    x = (x + 0x9E3779B97F4A7C15) & _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return x ^ (x >> 31)
+
+
+# Minimum register precision. Like HyperLogLog++'s high-precision sparse mode,
+# a floor of 2**14 registers (16 KiB per partition) keeps small cardinalities
+# effectively exact; a requested relativeSD only ever raises the precision.
+HLL_MIN_PRECISION = 14
+HLL_MAX_PRECISION = 18
+
+
+def hll_precision(relative_sd: float) -> int:
+    if relative_sd < 0.000017:
+        raise ValueError("relativeSD should be greater than 0.000017")
+    if relative_sd > 0.37:
+        raise ValueError("relativeSD should be smaller than 0.37")
+    import math
+
+    p = int(math.ceil(2.0 * math.log(1.054 / relative_sd) / math.log(2)))
+    return max(HLL_MIN_PRECISION, min(p, HLL_MAX_PRECISION))
+
+
+def _type_salt(value: Any) -> int:
+    """Deterministic per-type salt (str hashes are randomized per process)."""
+    import zlib
+
+    return zlib.crc32(type(value).__name__.encode()) << 32
+
+
+def hll_partition(iterator: Iterable[Any], p: int) -> Iterable[bytearray]:
+    """Build HyperLogLog registers for one partition."""
+    m = 1 << p
+    registers = bytearray(m)
+    shift = 64 - p
+    for value in iterator:
+        h = _mix64(portable_hash(value) ^ _type_salt(value))
+        idx = h >> shift
+        rest = (h << p) & _MASK64
+        rank = (64 - p + 1) if rest == 0 else (65 - rest.bit_length())
+        if rank > registers[idx]:
+            registers[idx] = rank
+    yield registers
+
+
+def hll_merge(a: bytearray, b: bytearray) -> bytearray:
+    return bytearray(map(max, a, b))
+
+
+def hll_estimate(registers: bytearray) -> int:
+    import math
+
+    m = len(registers)
+    alpha = {16: 0.673, 32: 0.697, 64: 0.709}.get(m, 0.7213 / (1.0 + 1.079 / m))
+    estimate = alpha * m * m / sum(2.0 ** -r for r in registers)
+    zeros = registers.count(0)
+    if estimate <= 2.5 * m and zeros:
+        estimate = m * math.log(m / zeros)  # linear counting (small range)
+    return int(round(estimate))

@@ -27,6 +27,9 @@ struct SubmitJob {
     std::shared_ptr<RDDBase> rdd;
     std::shared_ptr<std::promise<std::vector<std::any>>> promise;
     JobAction action = JobAction::COMPUTE_PARTITION;
+    // Subset of final-stage partitions to compute (empty = all). Results are
+    // returned in the order given here.
+    std::vector<size_t> partitions;
 };
 
 // JobActor -> WorkerActor: execute one partition.

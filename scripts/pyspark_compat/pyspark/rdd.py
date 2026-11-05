@@ -296,6 +296,18 @@ class RDD:
         return self._inner.countApproxDistinct(relativeSD)
 
     def cache(self) -> "RDD":
+        self._inner.cache()
+        return self
+
+    def persist(self, storageLevel=None) -> "RDD":
+        if storageLevel is None:
+            self._inner.persist()
+        else:
+            self._inner.persist(storageLevel)
+        return self
+
+    def unpersist(self, blocking: bool = False) -> "RDD":
+        self._inner.unpersist(blocking)
         return self
 
     def _reserialize(self, serializer) -> "RDD":
@@ -307,6 +319,32 @@ class RDD:
 
     def getResourceProfile(self):
         return self._resource_profile
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything not wrapped explicitly to the PyVega RDD,
+        # re-wrapping RDD results (and lists of RDDs, e.g. randomSplit).
+        if name.startswith("__"):
+            raise AttributeError(name)
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            args = tuple(a._inner if isinstance(a, RDD) else a for a in args)
+            kwargs = {k: (v._inner if isinstance(v, RDD) else v) for k, v in kwargs.items()}
+            result = self._run_action(lambda: attr(*args, **kwargs))
+            if isinstance(result, _PyVegaRDD):
+                return self._wrap(result, external_group=False)
+            if isinstance(result, list) and result and all(
+                isinstance(r, _PyVegaRDD) for r in result
+            ):
+                return [self._wrap(r, external_group=False) for r in result]
+            return result
+
+        return call
+
+    def __add__(self, other: "RDD") -> "RDD":
+        return self._wrap(self._inner.union(other._inner))
 
     def __repr__(self) -> str:
         return f"PySparkRDD({self._inner!r})"

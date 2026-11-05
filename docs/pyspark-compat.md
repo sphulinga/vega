@@ -7,12 +7,15 @@ Location: `scripts/pyspark_compat/`
 
 ## What works
 
-- **RDD API** — `map`, `filter`, `flatMap`, `reduceByKey`, `groupByKey`, `aggregate`,
-  `fold`, `sortByKey`, `zip`, `cartesian`, `pipe`, `broadcast`, `cache`, partition ops,
-  and most actions used in `pyspark.tests.test_rdd`
-- **SparkContext** — `parallelize`, `range`, `textFile`, job groups (stubs), resource
-  profile stubs
-- **50/54** upstream `test_rdd` cases pass (remaining 4 require JVM / Java RDD APIs)
+- **RDD API** — the full PySpark RDD surface: transformations (incl. joins,
+  `cogroup`, `combineByKey`, set operations, `zipWithIndex`, `randomSplit`,
+  `sampleByKey`), actions (incl. `stats`, `top`, `takeOrdered`, `countByKey`,
+  `countApprox`, `meanApprox`, `lookup`), `cache`/`persist`, accumulators,
+  broadcast, `pipe`, file I/O. The shim forwards any method it does not wrap
+  explicitly to PyVega.
+- **SparkContext** — `parallelize`, `range`, `textFile`, `wholeTextFiles`,
+  `binaryFiles`, `accumulator`, `runJob`, job groups, resource profile stubs
+- **53/57** upstream `test_rdd` cases pass (the remaining 4 require a JVM / Java RDD APIs)
 
 ## What does not work
 
@@ -38,6 +41,12 @@ python scripts/run_pyspark_tests.py --filter pyspark.tests.test_rdd
 Reports are written to `test-results/pyspark_vs_pyvega.json`.
 
 ### Fetch upstream Spark tests
+
+`scripts/fetch_spark_tests.sh` checks out a **pinned** Spark commit so results
+are reproducible (set `SPARK_REF=<sha|tag|branch>` to try another revision).
+CI then runs `scripts/check_pyspark_report.py`, which fails on any failure not
+listed in `scripts/pyspark_known_failures.txt` -- and on listed tests that
+start passing. Update both when moving the pin.
 
 ```bash
 ./scripts/fetch_spark_tests.sh

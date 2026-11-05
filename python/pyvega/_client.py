@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import builtins
 import os
+import pickle
 import shutil
 import socket
 import struct
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from pyvega._protocol import (
+    PROTOCOL_VERSION,
     Action,
     MsgType,
     NativeOp,
@@ -26,7 +30,6 @@ from pyvega._protocol import (
     pack_u64,
     pack_u8,
     unpack_bytes,
-    unpack_frame,
     unpack_u32,
     unpack_u64,
     unpack_u8,
@@ -70,10 +73,30 @@ def find_server_binary() -> str:
     )
 
 
-def spawn_server(num_workers: int = 0) -> tuple[subprocess.Popen, str, int]:
-    del num_workers
-    binary = find_server_binary()
+def _server_command() -> tuple[list[str], dict[str, str]]:
+    """Command used to launch a local session server.
+
+    Prefers the compiled ``pyvega._vega_server`` extension shipped in wheels:
+    it runs the server inside *this* interpreter build, which guarantees the
+    client and server agree on the Python version (required by cloudpickle).
+    Falls back to a standalone ``vega_server`` binary (source checkouts).
+    """
     env = os.environ.copy()
+    force_binary = env.get("VEGA_SERVER")
+    if not force_binary:
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("pyvega._vega_server") is not None:
+                pkg_root = str(Path(__file__).resolve().parents[1])
+                env["PYTHONPATH"] = os.pathsep.join(
+                    p for p in (pkg_root, env.get("PYTHONPATH", "")) if p
+                )
+                return [sys.executable, "-m", "pyvega._server_cli", "--embedded"], env
+        except (ImportError, ValueError):
+            pass
+
+    binary = find_server_binary()
     env["PYTHONHOME"] = sys.base_prefix
     py_lib = os.path.join(
         sys.base_prefix,
@@ -95,8 +118,14 @@ def spawn_server(num_workers: int = 0) -> tuple[subprocess.Popen, str, int]:
         )
         if p
     )
+    return [binary], env
+
+
+def spawn_server(num_workers: int = 0) -> tuple[subprocess.Popen, str, int]:
+    del num_workers
+    cmd, env = _server_command()
     proc = subprocess.Popen(
-        [binary, "--bind", "127.0.0.1", "--port", "0", "--print-listening"],
+        cmd + ["--bind", "127.0.0.1", "--port", "0", "--print-listening"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -108,6 +137,16 @@ def spawn_server(num_workers: int = 0) -> tuple[subprocess.Popen, str, int]:
         proc.kill()
         raise RuntimeError(f"failed to start vega_server: {line!r} {err}")
     port = int(line.strip().split()[1])
+    # Drain stderr in the background so a chatty server cannot block on a
+    # full pipe.
+    if proc.stderr is not None:
+        import threading as _threading
+
+        def _drain(stream) -> None:
+            for _ in stream:
+                pass
+
+        _threading.Thread(target=_drain, args=(proc.stderr,), daemon=True).start()
     return proc, "127.0.0.1", port
 
 
@@ -120,11 +159,68 @@ def parse_remote(remote: str) -> tuple[str, int]:
     return host, int(port_str)
 
 
+def _dumps_data(obj: Any) -> bytes:
+    """Pickle data with the fast C pickler, falling back to cloudpickle."""
+    try:
+        return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:  # noqa: BLE001 - lambdas, local classes, ...
+        return _pickle.dumps(obj)
+
+
+class RemoteError(RuntimeError):
+    """An exception raised on the Vega server that has no local equivalent."""
+
+
+def remote_exception(message: str) -> Exception:
+    """Rebuild a server-side Python exception with its original type.
+
+    Server errors arrive as text such as ``"ValueError: bad input"``. When the
+    prefix names a builtin exception type, an instance of that type is
+    returned so ``except ValueError`` works across the RPC boundary.
+    """
+    head = message.split("\n", 1)[0]
+    name, sep, _ = head.partition(":")
+    exc_type = getattr(builtins, name.strip(), None) if sep else None
+    if (
+        isinstance(exc_type, type)
+        and issubclass(exc_type, Exception)
+        and exc_type not in (StopIteration,)
+    ):
+        try:
+            return exc_type(message)
+        except Exception:  # noqa: BLE001 - exotic constructor signature
+            pass
+    return RuntimeError(message)
+
+
+# Message types whose reply means a job ran (used for accumulator updates).
+_JOB_MESSAGES = frozenset(
+    {
+        MsgType.EXECUTE,
+        MsgType.COUNT,
+        MsgType.COLLECT,
+        MsgType.REDUCE,
+        MsgType.FOREACH,
+        MsgType.COLLECT_PARTITIONS,
+        MsgType.COLLECT_PARTITION,
+        MsgType.RUN_JOB,
+        MsgType.NATIVE_STATS,
+    }
+)
+
+
 class SessionClient:
     def __init__(self, host: str, port: int, num_workers: int = 0):
         self._sock = socket.create_connection((host, port))
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._refs: dict[int, int] = {}
+        self._to_release: list[int] = []
+        self._closed = False
+        # Called (outside the lock) after every RPC that executed a job.
+        self.on_job_done = None
+        self.last_job: tuple[str, float] | None = None
+        self.protocol_version = 0
         self._workers = self._hello(num_workers)
 
     @property
@@ -132,38 +228,90 @@ class SessionClient:
         return self._workers
 
     def close(self) -> None:
+        self._closed = True
         try:
             self._sock.close()
         except OSError:
             pass
 
+    # ----- server-side handle lifetime ------------------------------------
+
+    def retain(self, rdd_id: int) -> None:
+        if rdd_id:
+            self._refs[rdd_id] = self._refs.get(rdd_id, 0) + 1
+
+    def release(self, rdd_id: int) -> None:
+        """Drop one reference; the server handle is freed at the next RPC."""
+        if not rdd_id or self._closed:
+            return
+        count = self._refs.get(rdd_id, 0) - 1
+        if count > 0:
+            self._refs[rdd_id] = count
+            return
+        self._refs.pop(rdd_id, None)
+        self._to_release.append(rdd_id)
+
+    def _flush_releases(self) -> None:
+        if not self._to_release or self.protocol_version < 2:
+            self._to_release.clear()
+            return
+        ids, self._to_release = self._to_release, []
+        body = pack_u32(len(ids)) + b"".join(pack_u64(i) for i in ids)
+        self._roundtrip(MsgType.RELEASE, body)
+
+    # ----- framing ---------------------------------------------------------
+
     def _recv_exact(self, n: int) -> bytes:
-        chunks: list[bytes] = []
+        buf = bytearray(n)
+        view = memoryview(buf)
         got = 0
         while got < n:
-            part = self._sock.recv(n - got)
-            if not part:
+            read = self._sock.recv_into(view[got:], n - got)
+            if not read:
                 raise ConnectionError("vega_server closed connection")
-            chunks.append(part)
-            got += len(part)
-        return b"".join(chunks)
+            got += read
+        return bytes(buf)
+
+    def _roundtrip(self, msg_type: MsgType, body: bytes) -> tuple[MsgType, bytes]:
+        frame = pack_frame(msg_type, body)
+        self._sock.sendall(frame)
+        header = self._recv_exact(4)
+        (length,) = struct.unpack(">I", header)
+        payload = self._recv_exact(length)
+        msg = MsgType(payload[0])
+        reply_body = payload[1:]
+        if msg == MsgType.ERROR:
+            err_bytes, _ = unpack_bytes(reply_body)
+            raise remote_exception(err_bytes.decode("utf-8", errors="replace"))
+        return msg, reply_body
 
     def _send_recv(self, msg_type: MsgType, body: bytes = b"") -> tuple[MsgType, bytes]:
+        is_job = msg_type in _JOB_MESSAGES
         with self._lock:
-            self._sock.sendall(pack_frame(msg_type, body))
-            header = self._recv_exact(4)
-            (length,) = struct.unpack(">I", header)
-            payload = self._recv_exact(length)
-            msg, reply_body = unpack_frame(header + payload)
-            if msg == MsgType.ERROR:
-                err_bytes, _ = unpack_bytes(reply_body)
-                raise RuntimeError(err_bytes.decode("utf-8", errors="replace"))
-            return msg, reply_body
+            if self._to_release:
+                self._flush_releases()
+            start = time.perf_counter() if is_job else 0.0
+            result = self._roundtrip(msg_type, body)
+            if is_job:
+                self.last_job = (msg_type.name.lower(), time.perf_counter() - start)
+        if is_job and self.on_job_done is not None:
+            self.on_job_done()
+        return result
 
     def _hello(self, num_workers: int) -> int:
         _, body = self._send_recv(MsgType.HELLO, pack_u32(num_workers))
-        workers, _ = unpack_u32(body)
+        workers, off = unpack_u32(body)
+        if len(body) >= off + 4:
+            self.protocol_version, _ = unpack_u32(body, off)
         return workers
+
+    def require_protocol(self, feature: str) -> None:
+        if self.protocol_version < PROTOCOL_VERSION:
+            raise RuntimeError(
+                f"{feature} requires a vega_server with protocol v{PROTOCOL_VERSION} "
+                f"(connected server speaks v{self.protocol_version}); rebuild or "
+                "upgrade the server"
+            )
 
     def parallelize_range(self, start: int, end: int, num_partitions: int) -> tuple[int, int]:
         body = pack_u64(start) + pack_u64(end) + pack_u32(num_partitions)
@@ -202,7 +350,7 @@ class SessionClient:
         return rdd_id, parts
 
     def parallelize(self, data: list[Any], num_partitions: int) -> tuple[int, int]:
-        pickled = _pickle.dumps(list(data))
+        pickled = _dumps_data(data if isinstance(data, list) else list(data))
         body = pack_u32(num_partitions) + pack_bytes(pickled)
         _, reply = self._send_recv(MsgType.PARALLELIZE, body)
         rdd_id, off = unpack_u64(reply)
@@ -398,8 +546,17 @@ class SessionClient:
         stages: list[PendingStage],
         line_meta: tuple[int, int] | None = None,
     ) -> tuple[int, int]:
+        fused = self._fuse_stages(stages, line_meta)
+        if self.protocol_version >= 2:
+            if not fused:
+                return rdd_id, num_partitions
+            body = pack_u64(rdd_id) + pack_u32(len(fused))
+            for stage in fused:
+                body += self._pack_stage(stage, num_partitions)
+            _, reply = self._send_recv(MsgType.APPLY_STAGES, body)
+            return self._transform_ack(reply)
         cur_id, parts = rdd_id, num_partitions
-        for stage in self._fuse_stages(stages, line_meta):
+        for stage in fused:
             native_op = stage.native_op
             native_params = stage.native_params
             if stage.op == StageOp.MAP:
@@ -446,7 +603,7 @@ class SessionClient:
             return int(value)
         if Action(action_code) == Action.COLLECT:
             data, _ = unpack_bytes(reply, off)
-            return list(_pickle.loads(data))
+            return pickle.loads(data)
         if Action(action_code) == Action.REDUCE:
             data, _ = unpack_bytes(reply, off)
             return _pickle.loads(data)
@@ -461,7 +618,7 @@ class SessionClient:
 
     def collect(self, rdd_id: int) -> list[Any]:
         _, reply = self._send_recv(MsgType.COLLECT, pack_u64(rdd_id))
-        return list(_pickle.loads(reply))
+        return pickle.loads(reply)
 
     def collect_partitions(self, rdd_id: int) -> list[list[Any]]:
         _, reply = self._send_recv(MsgType.COLLECT_PARTITIONS, pack_u64(rdd_id))
@@ -474,7 +631,7 @@ class SessionClient:
         return list(_pickle.loads(reply))
 
     def parallelize_partitions(self, partitions: list[list[Any]]) -> tuple[int, int]:
-        body = pack_bytes(_pickle.dumps(partitions))
+        body = pack_bytes(_dumps_data(partitions))
         _, reply = self._send_recv(MsgType.PARALLELIZE_PARTITIONS, body)
         rdd_id, off = unpack_u64(reply)
         parts, _ = unpack_u32(reply, off)
@@ -488,3 +645,68 @@ class SessionClient:
     def foreach(self, rdd_id: int, func) -> None:
         body = pack_u64(rdd_id) + pack_bytes(_pickle.dumps(func))
         self._send_recv(MsgType.FOREACH, body)
+
+    # ----- v0.6 server-side operators (protocol v2) -------------------------
+
+    def union(self, rdd_ids: list[int]) -> tuple[int, int]:
+        body = pack_u32(len(rdd_ids)) + b"".join(pack_u64(i) for i in rdd_ids)
+        _, reply = self._send_recv(MsgType.UNION, body)
+        return self._transform_ack(reply)
+
+    def partition_by(
+        self, rdd_id: int, num_partitions: int, func=None, round_robin: bool = False
+    ) -> tuple[int, int]:
+        blob = _pickle.dumps(func) if func is not None else b""
+        body = (
+            pack_u64(rdd_id)
+            + pack_u32(num_partitions)
+            + pack_u8(1 if round_robin else 0)
+            + pack_bytes(blob)
+        )
+        _, reply = self._send_recv(MsgType.PARTITION_BY, body)
+        return self._transform_ack(reply)
+
+    def coalesce(self, rdd_id: int, groups: list[list[int]]) -> tuple[int, int]:
+        body = pack_u64(rdd_id) + pack_u32(len(groups))
+        for group in groups:
+            body += pack_u32(len(group)) + b"".join(pack_u32(p) for p in group)
+        _, reply = self._send_recv(MsgType.COALESCE, body)
+        return self._transform_ack(reply)
+
+    def cartesian(self, left: int, right: int) -> tuple[int, int]:
+        _, reply = self._send_recv(MsgType.CARTESIAN, pack_u64(left) + pack_u64(right))
+        return self._transform_ack(reply)
+
+    def zip_partitions(self, left: int, right: int, func) -> tuple[int, int]:
+        body = pack_u64(left) + pack_u64(right) + pack_bytes(_pickle.dumps(func))
+        _, reply = self._send_recv(MsgType.ZIP_PARTITIONS, body)
+        return self._transform_ack(reply)
+
+    def persist(self, rdd_id: int) -> tuple[int, int]:
+        _, reply = self._send_recv(MsgType.PERSIST, pack_u64(rdd_id))
+        return self._transform_ack(reply)
+
+    def run_python(self, func, *args) -> Any:
+        """Run ``func(*args)`` inside the server interpreter."""
+        body = pack_bytes(_pickle.dumps((func, args)))
+        _, reply = self._send_recv(MsgType.RUN_PYTHON, body)
+        return pickle.loads(reply)
+
+    def run_job(self, rdd_id: int, partitions: list[int], counts: bool = False) -> list[Any]:
+        """Compute a subset of partitions (lists of elements, or counts)."""
+        body = (
+            pack_u64(rdd_id)
+            + pack_u32(len(partitions))
+            + b"".join(pack_u32(p) for p in partitions)
+            + pack_u8(1 if counts else 0)
+        )
+        _, reply = self._send_recv(MsgType.RUN_JOB, body)
+        return pickle.loads(reply)
+
+    def native_stats(self, rdd_id: int):
+        _, reply = self._send_recv(MsgType.NATIVE_STATS, pack_u64(rdd_id))
+        return pickle.loads(reply)
+
+    def describe(self, rdd_id: int) -> tuple[str, int, int]:
+        _, reply = self._send_recv(MsgType.DESCRIBE, pack_u64(rdd_id))
+        return tuple(pickle.loads(reply))

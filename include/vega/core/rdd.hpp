@@ -61,6 +61,14 @@ public:
     // MAP_DONE barrier).
     virtual void finalize_shuffle() {}
 
+    // True once a wide RDD's shuffle output is materialized and can be read
+    // without re-running the map side (enables stage skipping / reuse).
+    virtual bool shuffle_ready() const { return false; }
+
+    // Stable identity used by the DAG builder to de-duplicate lineage nodes.
+    // Thin wrappers forward to the wrapped RDD.
+    virtual const RDDBase* identity() const { return this; }
+
     // When true, partition pid covers indexed integers [begin, end) without materializing.
     virtual bool partition_indexed_ints(size_t pid,
                                           int64_t& begin,

@@ -193,21 +193,17 @@ with SparkContext(4) as sc:
 a.join(b, on="id")
 ```
 
-**RDD (keyed join via cartesian + filter — fine for small data):**
+**RDD (shuffle hash join, server-side):**
 
 ```python
-def join_by_key(a_rdd, b_rdd, key_fn=lambda x: x["id"]):
-    a = a_rdd.map(lambda r: (key_fn(r), r))
-    b = b_rdd.map(lambda r: (key_fn(r), r))
-    return (
-        a.cartesian(b)
-        .filter(lambda ab: ab[0][0] == ab[1][0])
-        .map(lambda ab: (ab[0][1], ab[1][1]))
-    )
+a = a_rdd.keyBy(lambda r: r["id"])
+b = b_rdd.keyBy(lambda r: r["id"])
+joined = a.join(b)                 # (id, (row_a, row_b))
+left = a.leftOuterJoin(b)          # (id, (row_a, row_b or None))
 ```
 
-For large joins, prefer **reduceByKey** / cogroup-style patterns after partitioning
-both sides by key (`partition_by`, `reduce_by_key`).
+`join`, `leftOuterJoin`, `rightOuterJoin`, `fullOuterJoin`, `cogroup` and
+`subtractByKey` all run as a single shuffle on the server.
 
 ---
 

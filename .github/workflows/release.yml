@@ -1,0 +1,172 @@
+name: Release (PyPI)
+
+# Builds an sdist plus binary wheels (Linux x86_64/aarch64, macOS arm64/x86_64,
+# CPython 3.9-3.13), smoke-tests every wheel, and publishes with PyPI Trusted
+# Publishing (OIDC) -- no API tokens are stored in the repository.
+#
+#   * Push a tag `vX.Y.Z` (matching python/pyvega/__init__.py) -> PyPI
+#   * Run manually (workflow_dispatch) -> TestPyPI by default
+#   * Pull requests touching packaging/C++ -> build + test wheels only
+#
+# One-time setup: see docs/releasing.md (create the `pypi` / `testpypi`
+# environments and register this workflow as a trusted publisher).
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release.yml"
+      - "pyproject.toml"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "src/**"
+      - "include/**"
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Where to publish"
+        type: choice
+        options: [testpypi, pypi, none]
+        default: testpypi
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    name: Check tag matches package version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' python/pyvega/__init__.py)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Package version: $version"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package version v${version}"
+            exit 1
+          fi
+
+  sdist:
+    name: Build sdist
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build --sdist
+          twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    name: Wheels (${{ matrix.name }})
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, archs: x86_64 }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, archs: aarch64 }
+          - { name: macos-arm64, os: macos-14, archs: arm64 }
+          # Intel macOS runner image; update the label when GitHub retires it.
+          - { name: macos-x86_64, os: macos-15-intel, archs: x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test wheels
+        uses: pypa/cibuildwheel@v2.23.3
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+      # The runner's system Python is externally managed (PEP 668), so check
+      # metadata with a dedicated interpreter.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check metadata
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check --strict wheelhouse/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheels-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [sdist, wheels]
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.repository == 'pypi')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyvega
+    permissions:
+      id-token: write  # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: [sdist, wheels]
+    if: github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/pyvega
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  github-release:
+    name: Attach artifacts to GitHub Release
+    needs: [check-version, publish-pypi]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Create release with dists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --generate-notes --verify-tag \
+            || gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

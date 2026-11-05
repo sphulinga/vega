@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,7 +31,7 @@ jobs:
       - name: Install Python build/runtime deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install "cloudpickle>=3.0" "pytest>=7.0"
 
       - name: Configure (CMake)
         run: >
@@ -51,6 +52,38 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/python
         run: python -m pytest python/tests/test_pyvega.py -q
 
+  wheel:
+    # Builds the package exactly as PyPI users get it (scikit-build-core +
+    # the in-process server extension) and runs the Python suite with no
+    # standalone vega_server binary available.
+    name: pip install . (py${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # actions/setup-python has no CPython 3.9 for newer runner images
+          # (ubuntu-latest is 26.04); test the oldest supported version on an
+          # image that still provides it.
+          - { os: ubuntu-24.04, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build and install wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --outdir dist
+          pip install dist/*.whl "pytest>=7.0"
+      - name: Test installed package
+        run: |
+          cp -r python/tests "$RUNNER_TEMP/tests"
+          cd "$RUNNER_TEMP"
+          python -m pytest tests -q
+
   pyspark-compat:
     name: PySpark RDD compatibility
     runs-on: ubuntu-latest
@@ -65,7 +98,7 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install "cloudpickle>=3.0" "pytest>=7.0"
 
       - name: Configure & build vega_server
         run: |
@@ -78,30 +111,18 @@ jobs:
       - name: Run PySpark RDD compatibility suite
         env:
           VEGA_SERVER: ${{ github.workspace }}/build-release/vega_server
+          PYTHONPATH: ${{ github.workspace }}/python
         run: |
-          # The runner exits non-zero on the 4 known JVM-only tests, which
-          # require a JVM/Java RDD and cannot pass against PyVega. We tolerate
-          # those here and gate on the JSON report instead.
+          # The runner exits non-zero whenever any upstream test fails,
+          # including the known JVM-only ones; the gate below decides.
           python scripts/run_pyspark_tests.py --filter pyspark.tests.test_rdd || true
-          python - <<'PY'
-          import json, sys
-          with open("test-results/pyspark_vs_pyvega.json") as f:
-              report = json.load(f)
-          s = report["summary"]
-          print(f"passed={s['passed']} failed={s['failed']} errors={s['errors']}")
-          # Allowed: up to 4 JVM-only errors (_jvm, _jrdd, _to_java_object_rdd,
-          # SparkSession.createDataFrame). No plain failures are allowed.
-          MAX_JVM_ERRORS = 4
-          problems = []
-          if s["failed"] != 0:
-              problems.append(f"{s['failed']} unexpected test failures")
-          if s["errors"] > MAX_JVM_ERRORS:
-              problems.append(
-                  f"{s['errors']} errors exceed the {MAX_JVM_ERRORS} known JVM-only tests"
-              )
-          if s["import_failures"]:
-              problems.append(f"{s['import_failures']} import failures")
-          if problems:
-              sys.exit("PySpark compat regression: " + "; ".join(problems))
-          print("PySpark compatibility within expected bounds.")
-          PY
+
+      - name: Check results against known JVM-only failures
+        run: python scripts/check_pyspark_report.py
+
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyspark-compat-report
+          path: test-results/pyspark_vs_pyvega.json
