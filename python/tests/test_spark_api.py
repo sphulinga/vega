@@ -418,3 +418,16 @@ class TestVegaExtras:
     def test_explain_reports_native_fusion(self, sc):
         text = sc.range(0, 100).filter(lambda x: x % 2 == 0).map(lambda x: str(x)).explain()
         assert "native C++" in text and "Python UDF" in text
+
+
+def test_count_approx_distinct_stable_across_hash_seeds(monkeypatch):
+    """Regression: string hashing is randomized per server process, and with
+    too few registers small cardinalities were estimated as 18 for 20 items
+    under some seeds (upstream test_count_approx_distinct was flaky)."""
+    data = [i % 20 for i in range(1000)]
+    for seed in range(6):
+        monkeypatch.setenv("PYTHONHASHSEED", str(seed))
+        with SparkContext(2) as ctx:
+            rdd = ctx.parallelize(data, 7)
+            for variant in (rdd, rdd.map(str), rdd.map(lambda x: (x, -x))):
+                assert 18 < variant.countApproxDistinct() < 22

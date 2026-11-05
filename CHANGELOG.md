@@ -79,6 +79,10 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - Release workflow also runs (build + test only, no publishing) on pull
   requests that touch packaging or C++ sources, so the wheel matrix is
   validated before a tag is pushed.
+- `countApproxDistinct` was flaky (upstream `test_count_approx_distinct`
+  failed for ~13% of hash seeds): register precision now has a floor of 2^14
+  (HyperLogLog++-style high precision for small cardinalities) and the
+  per-type hash salt is deterministic.
 - Chained shuffles (e.g. `reduceByKey(...).map(...).groupByKey()`) failed with
   "shuffle data not prepared".
 - `count()` on a fully native pipeline dropped the pending transformations, so

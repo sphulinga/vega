@@ -128,6 +128,13 @@ def _mix64(x: int) -> int:
     return x ^ (x >> 31)
 
 
+# Minimum register precision. Like HyperLogLog++'s high-precision sparse mode,
+# a floor of 2**14 registers (16 KiB per partition) keeps small cardinalities
+# effectively exact; a requested relativeSD only ever raises the precision.
+HLL_MIN_PRECISION = 14
+HLL_MAX_PRECISION = 18
+
+
 def hll_precision(relative_sd: float) -> int:
     if relative_sd < 0.000017:
         raise ValueError("relativeSD should be greater than 0.000017")
@@ -136,7 +143,14 @@ def hll_precision(relative_sd: float) -> int:
     import math
 
     p = int(math.ceil(2.0 * math.log(1.054 / relative_sd) / math.log(2)))
-    return max(4, min(p, 18))
+    return max(HLL_MIN_PRECISION, min(p, HLL_MAX_PRECISION))
+
+
+def _type_salt(value: Any) -> int:
+    """Deterministic per-type salt (str hashes are randomized per process)."""
+    import zlib
+
+    return zlib.crc32(type(value).__name__.encode()) << 32
 
 
 def hll_partition(iterator: Iterable[Any], p: int) -> Iterable[bytearray]:
@@ -145,7 +159,7 @@ def hll_partition(iterator: Iterable[Any], p: int) -> Iterable[bytearray]:
     registers = bytearray(m)
     shift = 64 - p
     for value in iterator:
-        h = _mix64(portable_hash(value) ^ (hash(type(value).__name__) & 0xFFFF) << 32)
+        h = _mix64(portable_hash(value) ^ _type_salt(value))
         idx = h >> shift
         rest = (h << p) & _MASK64
         rank = (64 - p + 1) if rest == 0 else (65 - rest.bit_length())
@@ -155,7 +169,7 @@ def hll_partition(iterator: Iterable[Any], p: int) -> Iterable[bytearray]:
 
 
 def hll_merge(a: bytearray, b: bytearray) -> bytearray:
-    return bytearray(max(x, y) for x, y in zip(a, b))
+    return bytearray(map(max, a, b))
 
 
 def hll_estimate(registers: bytearray) -> int:
