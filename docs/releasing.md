@@ -49,6 +49,9 @@ No API tokens or secrets are needed: the workflow authenticates with OIDC
    git push origin vX.Y.Z
    ```
 
+   The tag may be `vX.Y.Z` or `X.Y.Z`; push only one of them per release
+   (each tag push starts a separate release run).
+
    The workflow checks that the tag matches `__version__`, builds the sdist and
    all wheels, publishes to PyPI, and creates a GitHub Release with the files
    attached.
