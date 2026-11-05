@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
-## [0.6.0] - Unreleased
+## [1.0.0] - 2026-11-05
 
 ### Added
 - **PyPI packaging.** The session server now also builds as a CPython extension
