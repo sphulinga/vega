@@ -42,6 +42,12 @@ Reports are written to `test-results/pyspark_vs_pyvega.json`.
 
 ### Fetch upstream Spark tests
 
+`scripts/fetch_spark_tests.sh` checks out a **pinned** Spark commit so results
+are reproducible (set `SPARK_REF=<sha|tag|branch>` to try another revision).
+CI then runs `scripts/check_pyspark_report.py`, which fails on any failure not
+listed in `scripts/pyspark_known_failures.txt` -- and on listed tests that
+start passing. Update both when moving the pin.
+
 ```bash
 ./scripts/fetch_spark_tests.sh
 ```

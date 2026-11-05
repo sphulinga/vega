@@ -71,6 +71,14 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   `VEGA_BUILD_EXAMPLES`; an installed pybind11 is preferred over fetching it.
 
 ### Fixed
+- CI: the PySpark compatibility job tracked Spark `master` and gated on an
+  error *count*, so new upstream tests broke the build. Spark test sources are
+  now pinned (`scripts/fetch_spark_tests.sh`) and results are checked against
+  an explicit list of JVM-only tests (`scripts/check_pyspark_report.py`,
+  `scripts/pyspark_known_failures.txt`); the report is uploaded as an artifact.
+- Release workflow also runs (build + test only, no publishing) on pull
+  requests that touch packaging or C++ sources, so the wheel matrix is
+  validated before a tag is pushed.
 - Chained shuffles (e.g. `reduceByKey(...).map(...).groupByKey()`) failed with
   "shuffle data not prepared".
 - `count()` on a fully native pipeline dropped the pending transformations, so

@@ -1,0 +1,10 @@
+# Upstream PySpark tests that cannot pass against PyVega (one test id per line).
+# CI fails on any failure/error NOT listed here, and on listed tests that start
+# passing (so this list stays accurate). Keep in sync with the pinned Spark
+# revision in scripts/fetch_spark_tests.sh.
+
+# Require a JVM / Java RDD bridge:
+pyspark.tests.test_rdd.RDDTests.test_multiple_python_java_RDD_conversions  # _to_java_object_rdd
+pyspark.tests.test_rdd.RDDTests.test_null_in_rdd                           # sc._jvm
+pyspark.tests.test_rdd.RDDTests.test_take_on_jrdd                          # rdd._jrdd
+pyspark.tests.test_rdd.RDDTests.test_take_on_jrdd_with_large_rows_should_not_cause_deadlock  # rdd._jrdd (+ numpy)
