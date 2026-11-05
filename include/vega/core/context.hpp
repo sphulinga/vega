@@ -62,38 +62,39 @@ public:
     // Submit an RDD for execution and return per-partition results.
     // Blocks until the job completes.
     std::vector<std::any> execute(std::shared_ptr<RDDBase> rdd) {
-        auto promise =
-            std::make_shared<std::promise<std::vector<std::any>>>();
-        auto future = promise->get_future();
+        return execute_partitions(std::move(rdd), {});
+    }
 
-        size_t jid = next_job_id_.fetch_add(1, std::memory_order_relaxed);
-
-        system_->send<msg::SubmitJob>(job_actor_id_, msg::SubmitJob{
-            jid, std::move(rdd), std::move(promise),
-            msg::JobAction::COMPUTE_PARTITION
-        });
-
-        return future.get();
+    // Execute only the given final-stage partitions (empty = all). Upstream
+    // shuffles are still fully materialized (or reused if already ready).
+    // Results are returned in the order of `partitions`.
+    std::vector<std::any> execute_partitions(std::shared_ptr<RDDBase> rdd,
+                                             std::vector<size_t> partitions) {
+        return submit(std::move(rdd), msg::JobAction::COMPUTE_PARTITION,
+                      std::move(partitions));
     }
 
     size_t execute_count(std::shared_ptr<RDDBase> rdd) {
-        auto promise =
-            std::make_shared<std::promise<std::vector<std::any>>>();
-        auto future = promise->get_future();
-
-        size_t jid = next_job_id_.fetch_add(1, std::memory_order_relaxed);
-
-        system_->send<msg::SubmitJob>(job_actor_id_, msg::SubmitJob{
-            jid, std::move(rdd), std::move(promise),
-            msg::JobAction::COUNT_PARTITION
-        });
-
-        auto partition_results = future.get();
+        auto partition_results =
+            submit(std::move(rdd), msg::JobAction::COUNT_PARTITION, {});
         size_t total = 0;
         for (auto& pr : partition_results) {
             total += std::any_cast<size_t>(std::move(pr));
         }
         return total;
+    }
+
+    // Per-partition record counts for a subset of partitions.
+    std::vector<size_t> execute_count_partitions(std::shared_ptr<RDDBase> rdd,
+                                                 std::vector<size_t> partitions) {
+        auto partition_results = submit(std::move(rdd),
+                                        msg::JobAction::COUNT_PARTITION,
+                                        std::move(partitions));
+        std::vector<size_t> out;
+        out.reserve(partition_results.size());
+        for (auto& pr : partition_results)
+            out.push_back(std::any_cast<size_t>(std::move(pr)));
+        return out;
     }
 
     void stop() {
@@ -103,6 +104,22 @@ public:
     size_t num_workers() const { return num_workers_; }
 
 private:
+    std::vector<std::any> submit(std::shared_ptr<RDDBase> rdd,
+                                 msg::JobAction action,
+                                 std::vector<size_t> partitions) {
+        auto promise =
+            std::make_shared<std::promise<std::vector<std::any>>>();
+        auto future = promise->get_future();
+
+        size_t jid = next_job_id_.fetch_add(1, std::memory_order_relaxed);
+
+        msg::SubmitJob job{jid, std::move(rdd), std::move(promise), action};
+        job.partitions = std::move(partitions);
+        system_->send<msg::SubmitJob>(job_actor_id_, std::move(job));
+
+        return future.get();
+    }
+
     size_t num_workers_;
     std::unique_ptr<actor::ActorSystem> system_;
     std::unique_ptr<LocalTransport> transport_;

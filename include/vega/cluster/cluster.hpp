@@ -482,12 +482,17 @@ RDD<T> Cluster::scatter(const std::vector<T>& data,
 template<typename T>
 std::vector<T> Cluster::collect(const RDD<T>& rdd) {
     size_t job_id = next_job_id_.fetch_add(1, std::memory_order_relaxed);
-    auto plan = DAGBuilder::build(job_id, rdd.impl());
+    // The P2P path performs its own shuffle exchange per job, so it never
+    // reuses locally materialized shuffle state.
+    auto plan = DAGBuilder::build(job_id, rdd.impl(), {}, /*reuse_shuffles=*/false);
 
     if (plan.stages.size() <= 1)
         return execute_narrow<T>(plan, rdd, job_id);
-    else
-        return execute_with_shuffle<T>(plan, rdd, job_id);
+    if (plan.stages.size() > 2)
+        throw std::runtime_error(
+            "Cluster: lineages with more than one shuffle are not supported "
+            "in P2P mode yet");
+    return execute_with_shuffle<T>(plan, rdd, job_id);
 }
 
 template<typename T>

@@ -7,12 +7,15 @@ Location: `scripts/pyspark_compat/`
 
 ## What works
 
-- **RDD API** — `map`, `filter`, `flatMap`, `reduceByKey`, `groupByKey`, `aggregate`,
-  `fold`, `sortByKey`, `zip`, `cartesian`, `pipe`, `broadcast`, `cache`, partition ops,
-  and most actions used in `pyspark.tests.test_rdd`
-- **SparkContext** — `parallelize`, `range`, `textFile`, job groups (stubs), resource
-  profile stubs
-- **50/54** upstream `test_rdd` cases pass (remaining 4 require JVM / Java RDD APIs)
+- **RDD API** — the full PySpark RDD surface: transformations (incl. joins,
+  `cogroup`, `combineByKey`, set operations, `zipWithIndex`, `randomSplit`,
+  `sampleByKey`), actions (incl. `stats`, `top`, `takeOrdered`, `countByKey`,
+  `countApprox`, `meanApprox`, `lookup`), `cache`/`persist`, accumulators,
+  broadcast, `pipe`, file I/O. The shim forwards any method it does not wrap
+  explicitly to PyVega.
+- **SparkContext** — `parallelize`, `range`, `textFile`, `wholeTextFiles`,
+  `binaryFiles`, `accumulator`, `runJob`, job groups, resource profile stubs
+- **53/57** upstream `test_rdd` cases pass (the remaining 4 require a JVM / Java RDD APIs)
 
 ## What does not work
 

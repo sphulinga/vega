@@ -30,7 +30,7 @@ jobs:
       - name: Install Python build/runtime deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install "cloudpickle>=3.0" "pytest>=7.0"
 
       - name: Configure (CMake)
         run: >
@@ -51,6 +51,33 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/python
         run: python -m pytest python/tests/test_pyvega.py -q
 
+  wheel:
+    # Builds the package exactly as PyPI users get it (scikit-build-core +
+    # the in-process server extension) and runs the Python suite with no
+    # standalone vega_server binary available.
+    name: pip install . (py${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build and install wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --outdir dist
+          pip install dist/*.whl "pytest>=7.0"
+      - name: Test installed package
+        run: |
+          cp -r python/tests "$RUNNER_TEMP/tests"
+          cd "$RUNNER_TEMP"
+          python -m pytest tests -q
+
   pyspark-compat:
     name: PySpark RDD compatibility
     runs-on: ubuntu-latest
@@ -65,7 +92,7 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install "cloudpickle>=3.0" "pytest>=7.0"
 
       - name: Configure & build vega_server
         run: |
@@ -78,6 +105,7 @@ jobs:
       - name: Run PySpark RDD compatibility suite
         env:
           VEGA_SERVER: ${{ github.workspace }}/build-release/vega_server
+          PYTHONPATH: ${{ github.workspace }}/python
         run: |
           # The runner exits non-zero on the 4 known JVM-only tests, which
           # require a JVM/Java RDD and cannot pass against PyVega. We tolerate

@@ -72,9 +72,8 @@ class SparkContext:
     def union(self, rdds: list[RDD]) -> RDD:
         return RDD(self._ctx.union([r._inner for r in rdds]), self)
 
-    def textFile(self, path: str, minPartitions: int | None = None) -> RDD:
-        parts = minPartitions or self._ctx.num_workers
-        return RDD(self._ctx.textFile(path, parts), self)
+    def textFile(self, path: str, minPartitions: int | None = None, use_unicode: bool = True) -> RDD:
+        return RDD(self._ctx.textFile(path, minPartitions, use_unicode), self)
 
     def pickleFile(self, path: str, minPartitions: int | None = None) -> RDD:
         parts = minPartitions or self._ctx.num_workers
@@ -108,6 +107,30 @@ class SparkContext:
     @property
     def defaultParallelism(self) -> int:
         return self._ctx.num_workers
+
+    def cancelAllJobs(self) -> None:
+        self._ctx.cancelAllJobs()
+
+    def accumulator(self, value: Any, accum_param: Any = None) -> Any:
+        return self._ctx.accumulator(value, accum_param)
+
+    def wholeTextFiles(self, path: str, minPartitions: int | None = None, use_unicode: bool = True) -> RDD:
+        return RDD(self._ctx.wholeTextFiles(path, minPartitions, use_unicode), self)
+
+    def binaryFiles(self, path: str, minPartitions: int | None = None) -> RDD:
+        return RDD(self._ctx.binaryFiles(path, minPartitions), self)
+
+    def runJob(self, rdd: RDD, partitionFunc: Any, partitions: Any = None, allowLocal: bool = False):
+        return self._ctx.runJob(rdd._inner, partitionFunc, partitions, allowLocal)
+
+    @property
+    def version(self) -> str:
+        return self._ctx.version
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._ctx, name)
 
     def __enter__(self) -> "SparkContext":
         return self

@@ -41,7 +41,35 @@ class MsgType(IntEnum):
     PARALLELIZE_PARTITIONS_ACK = 0xA1
     EXECUTE = 0x92
     EXECUTE_ACK = 0x93
+    APPLY_STAGES = 0xA2
+    APPLY_STAGES_ACK = 0xA3
+    UNION = 0xA4
+    UNION_ACK = 0xA5
+    PARTITION_BY = 0xA6
+    PARTITION_BY_ACK = 0xA7
+    PERSIST = 0xA8
+    PERSIST_ACK = 0xA9
+    RELEASE = 0xAA
+    RELEASE_ACK = 0xAB
+    RUN_PYTHON = 0xAC
+    RUN_PYTHON_ACK = 0xAD
+    COALESCE = 0xAE
+    COALESCE_ACK = 0xAF
+    CARTESIAN = 0xB0
+    CARTESIAN_ACK = 0xB1
+    ZIP_PARTITIONS = 0xB2
+    ZIP_PARTITIONS_ACK = 0xB3
+    RUN_JOB = 0xB4
+    RUN_JOB_ACK = 0xB5
+    NATIVE_STATS = 0xB6
+    NATIVE_STATS_ACK = 0xB7
+    DESCRIBE = 0xB8
+    DESCRIBE_ACK = 0xB9
     ERROR = 0xFF
+
+
+# Protocol revision reported by the server in HELLO_ACK (0 = pre-0.6 server).
+PROTOCOL_VERSION = 2
 
 
 class StageOp(IntEnum):
@@ -50,6 +78,7 @@ class StageOp(IntEnum):
     FLAT_MAP = 3
     REDUCE_BY_KEY = 4
     GROUP_BY_KEY = 5
+    MAP_PARTITIONS = 6  # func(partition_index, iterator) -> iterable
 
 
 class NativeOp(IntEnum):

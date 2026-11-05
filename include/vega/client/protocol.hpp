@@ -43,6 +43,31 @@ enum class MsgType : uint8_t {
     ParallelizePartitionsAck = 0xA1,
     Execute        = 0x92,
     ExecuteAck     = 0x93,
+    // --- v0.6 server-side operators --------------------------------------
+    ApplyStages    = 0xA2,   // base id + stages -> new id (one round trip)
+    ApplyStagesAck = 0xA3,
+    Union          = 0xA4,   // ids -> concatenated RDD
+    UnionAck       = 0xA5,
+    PartitionBy    = 0xA6,   // id, partitions, mode, partitioner -> shuffled RDD
+    PartitionByAck = 0xA7,
+    Persist        = 0xA8,   // id -> cached RDD id
+    PersistAck     = 0xA9,
+    Release        = 0xAA,   // ids -> drop server-side handles
+    ReleaseAck     = 0xAB,
+    RunPython      = 0xAC,   // pickled (func, args) -> pickled result
+    RunPythonAck   = 0xAD,
+    Coalesce       = 0xAE,   // id + partition groups -> narrow coalesced RDD
+    CoalesceAck    = 0xAF,
+    Cartesian      = 0xB0,
+    CartesianAck   = 0xB1,
+    ZipPartitions  = 0xB2,
+    ZipPartitionsAck = 0xB3,
+    RunJob         = 0xB4,   // id + partition subset + mode -> per-partition results
+    RunJobAck      = 0xB5,
+    NativeStats    = 0xB6,   // id -> (count, sum, min, max, m2) or None
+    NativeStatsAck = 0xB7,
+    Describe       = 0xB8,   // id -> storage kind, partitions, cached partitions
+    DescribeAck    = 0xB9,
     Error         = 0xff,
 };
 

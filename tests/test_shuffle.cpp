@@ -138,3 +138,69 @@ TEST_F(ShuffleTest, DAGBuilderDetectsShuffleBoundary) {
     EXPECT_TRUE(plan.stages[1].is_shuffle_boundary);
     EXPECT_NE(plan.stages[1].shuffle_rdd, nullptr);
 }
+
+TEST_F(ShuffleTest, ChainedShufflesExecuteAsMultipleStages) {
+    std::vector<std::pair<int, int>> data;
+    for (int i = 0; i < 100; ++i) data.emplace_back(i % 10, 1);
+
+    // reduceByKey -> re-key -> reduceByKey: two shuffle boundaries.
+    auto rdd = ctx.parallelize(data, 4)
+        .reduceByKey([](int a, int b) { return a + b; })
+        .map([](const std::pair<int, int>& kv) {
+            return std::pair<int, int>{kv.first % 2, kv.second};
+        })
+        .reduceByKey([](int a, int b) { return a + b; }, 3);
+
+    auto plan = DAGBuilder::build(0, rdd.impl());
+    ASSERT_EQ(plan.stages.size(), 3u);
+    EXPECT_FALSE(plan.stages[0].is_shuffle_boundary);
+    EXPECT_TRUE(plan.stages[1].is_shuffle_boundary);
+    EXPECT_TRUE(plan.stages[2].is_shuffle_boundary);
+
+    auto result = rdd.collect();
+    std::sort(result.begin(), result.end());
+    ASSERT_EQ(result.size(), 2u);
+    EXPECT_EQ(result[0], (std::pair<int, int>{0, 50}));
+    EXPECT_EQ(result[1], (std::pair<int, int>{1, 50}));
+    EXPECT_EQ(rdd.count(), 2u);
+}
+
+TEST_F(ShuffleTest, MaterializedShuffleIsReused) {
+    std::vector<std::pair<int, int>> data = {{1, 1}, {2, 2}, {1, 3}};
+    auto rdd = ctx.parallelize(data, 2)
+        .reduceByKey([](int a, int b) { return a + b; });
+
+    EXPECT_EQ(DAGBuilder::build(0, rdd.impl()).stages.size(), 2u);
+    (void)rdd.collect();
+    // Shuffle output is ready: the map stage is skipped.
+    auto plan = DAGBuilder::build(0, rdd.impl());
+    EXPECT_EQ(plan.stages.size(), 1u);
+    // ...unless reuse is disabled.
+    EXPECT_EQ(DAGBuilder::build(0, rdd.impl(), {}, false).stages.size(), 2u);
+
+    auto again = rdd.collect();
+    std::sort(again.begin(), again.end());
+    ASSERT_EQ(again.size(), 2u);
+    EXPECT_EQ(again[0], (std::pair<int, int>{1, 4}));
+}
+
+TEST_F(ShuffleTest, ExecutePartitionSubset) {
+    std::vector<int> data = {0, 1, 2, 3, 4, 5, 6, 7};
+    auto rdd = ctx.parallelize(data, 4);
+    auto parts = ctx.execute_partitions(rdd.impl(), {3, 1});
+    ASSERT_EQ(parts.size(), 2u);
+    EXPECT_EQ(std::any_cast<std::vector<int>>(parts[0]), (std::vector<int>{6, 7}));
+    EXPECT_EQ(std::any_cast<std::vector<int>>(parts[1]), (std::vector<int>{2, 3}));
+
+    auto counts = ctx.execute_count_partitions(rdd.impl(), {0, 2});
+    EXPECT_EQ(counts, (std::vector<size_t>{2u, 2u}));
+
+    // Subset of a shuffled RDD still runs the full map stage first.
+    std::vector<std::pair<int, int>> kv = {{1, 1}, {2, 2}, {3, 3}, {1, 1}};
+    auto reduced = ctx.parallelize(kv, 2)
+        .reduceByKey([](int a, int b) { return a + b; }, 2);
+    auto sub = ctx.execute_partitions(reduced.impl(), {0});
+    ASSERT_EQ(sub.size(), 1u);
+    auto total = ctx.execute_count(reduced.impl());
+    EXPECT_EQ(total, 3u);
+}

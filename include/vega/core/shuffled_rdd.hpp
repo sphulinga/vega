@@ -101,6 +101,11 @@ public:
         shuffle_ready_ = true;
     }
 
+    bool shuffle_ready() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return shuffle_ready_;
+    }
+
     // --- Compute -----------------------------------------------------------
 
     std::any compute_partition(size_t pid) const override {
@@ -223,6 +228,11 @@ public:
     void finalize_shuffle() override {
         std::lock_guard<std::mutex> lock(mu_);
         shuffle_ready_ = true;
+    }
+
+    bool shuffle_ready() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return shuffle_ready_;
     }
 
     std::any compute_partition(size_t pid) const override {

@@ -22,7 +22,7 @@ See the [docs index](docs/README.md) for an overview. In short:
 
 - C++17 compiler (GCC 8+, Clang 7+)
 - CMake 3.16+
-- Python 3.8+
+- Python 3.9+
 - Linux or macOS (POSIX sockets)
 
 ## Build
@@ -36,7 +36,8 @@ cmake --build build-release -j$(nproc)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[test]"
+pip install -e ".[test]"        # builds the pyvega._vega_server extension
+# optional: test against the standalone binary instead of the extension
 export VEGA_SERVER="$PWD/build-release/vega_server"
 ```
 
@@ -48,13 +49,18 @@ cd build-release && ctest --output-on-failure && cd ..
 
 # PyVega Python tests
 VEGA_SERVER=build-release/vega_server PYTHONPATH=python \
-  python -m pytest python/tests/test_pyvega.py -q
+  python -m pytest python/tests -q
 
 # Upstream PySpark RDD compatibility tests (optional; fetches Spark sources)
 ./scripts/fetch_spark_tests.sh
 VEGA_SERVER=build-release/vega_server \
   python scripts/run_pyspark_tests.py --filter pyspark.tests.test_rdd
 ```
+
+Benchmarks: `python benchmarks/bench_pyvega_ops.py --json out.json` times common
+operations; run it before and after a performance change.
+
+Releases: see [docs/releasing.md](docs/releasing.md).
 
 > **Note:** `third_party/spark/` is fetched on demand by
 > `scripts/fetch_spark_tests.sh` and is intentionally git-ignored. You do not

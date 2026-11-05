@@ -3,13 +3,18 @@
 This guide walks through building Vega, installing PyVega, and running your first
 distributed RDD program.
 
+> **Just want to use it?** `pip install pyvega` installs a prebuilt wheel
+> (Linux x86_64/aarch64, macOS arm64/x86_64, CPython 3.9-3.13) that already
+> contains the C++ server. Skip to [Hello, Vega](#4-hello-vega). The steps
+> below are for building from source.
+
 ## Prerequisites
 
 | Component | Version | Notes |
 |-----------|---------|-------|
 | C++ compiler | C++17 (GCC 8+, Clang 7+) | Required to build `vega_server` |
 | CMake | 3.16+ | |
-| Python | 3.8+ | Client and embedded interpreter in the server |
+| Python | 3.9+ | Client and embedded interpreter in the server |
 | POSIX sockets | — | Linux or macOS |
 
 Optional:
@@ -26,9 +31,12 @@ python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-## 2. Build the session server
+## 2. Build the session server (optional for Python users)
 
-PyVega requires the `vega_server` binary. It embeds Python to execute user-defined
+`pip install .` (step 3) compiles the server as a Python extension
+(`pyvega._vega_server`), which is all PyVega needs. Build the standalone
+`vega_server` binary only for C++ development, the C++ tests, or to run a server
+without a Python package installed. It embeds Python to execute user-defined
 functions (UDFs) on worker threads.
 
 ```bash
@@ -60,10 +68,12 @@ From the repository root:
 pip install -e ".[test]"
 ```
 
-This installs the `pyvega` package and the `vega-server` console script (a thin wrapper
-around the `vega_server` binary).
+This compiles the in-process server extension (via scikit-build-core and CMake)
+and installs the `pyvega` package plus the `vega-server` console script.
+`SparkContext(4)` then starts a private server with the same Python interpreter.
 
-Tell PyVega where to find the server if it is not on `PATH`:
+To use a standalone binary instead (e.g. one built in step 2), point
+`VEGA_SERVER` at it; it takes precedence over the extension:
 
 ```bash
 export VEGA_SERVER="$PWD/build-release/vega_server"
