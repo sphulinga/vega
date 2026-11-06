@@ -18,18 +18,29 @@ sockets).
 
 ## One-time setup (repository admin)
 
-1. **Create the PyPI project publisher** (works before the project exists):
-   on <https://pypi.org/manage/account/publishing/> add a *pending trusted
-   publisher* with
-   - PyPI project name: `pyvega`
-   - Owner / repository: `sphulinga` / `vega`
+1. **Register the trusted publisher on PyPI.** `pyvega` already exists on
+   PyPI (0.5.0 was uploaded by hand), so add it to the existing project:
+   <https://pypi.org/manage/project/pyvega/settings/publishing/> (*pyvega ->
+   Manage -> Publishing*), signed in as a project owner. Add a GitHub publisher
+   with exactly:
+   - Owner: `sphulinga`
+   - Repository: `vega`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
-2. Do the same on <https://test.pypi.org/manage/account/publishing/> with
-   environment `testpypi`.
-3. In GitHub, *Settings -> Environments*, create environments `pypi` and
-   `testpypi`. Adding required reviewers to `pypi` gives a manual approval gate
-   before each upload.
+
+   (For a project that does not exist yet, add the same values as a *pending
+   publisher* on <https://pypi.org/manage/account/publishing/> instead.)
+2. Do the same on TestPyPI (<https://test.pypi.org>) with environment
+   `testpypi`, if you want manual dry runs.
+3. In GitHub, *Settings -> Environments*, make sure environments `pypi` and
+   `testpypi` exist. Adding required reviewers to `pypi` gives a manual
+   approval gate before each upload.
+
+If the publish job fails with `invalid-publisher` ("no corresponding
+publisher"), step 1 is missing or one of its four values doesn't match. The
+job log prints the claims GitHub sent (`repository`, `workflow_ref`,
+`environment`); compare them with the publisher on PyPI. Nothing is uploaded
+in that case, so after fixing it use *Re-run failed jobs* on the same run.
 
 No API tokens or secrets are needed: the workflow authenticates with OIDC
 (`id-token: write`).
@@ -48,6 +59,9 @@ No API tokens or secrets are needed: the workflow authenticates with OIDC
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
+
+   The tag may be `vX.Y.Z` or `X.Y.Z`; push only one of them per release
+   (each tag push starts a separate release run).
 
    The workflow checks that the tag matches `__version__`, builds the sdist and
    all wheels, publishes to PyPI, and creates a GitHub Release with the files
