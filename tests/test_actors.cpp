@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <numeric>
 #include <sstream>
@@ -57,6 +59,51 @@ TEST(ActorSystemTest, StartAndStop) {
     sys.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     sys.stop();
+}
+
+// Regression: stop() used to clear `running_` without holding the ready-queue
+// mutex, so a worker that had just checked the wait predicate could miss the
+// shutdown notification and sleep forever, hanging stop() in join(). This
+// hung CI for 6 hours on macOS. The window is a few instructions wide and is
+// hit when stop() runs just as a worker returns to wait() -- e.g. right after
+// that worker's handler unblocked the caller -- so each cycle does exactly
+// that. It is probabilistic (a few thousand cycles); a watchdog turns a hang
+// into a failure instead of a stuck test run.
+namespace {
+struct Signal { int value; };
+class SignalActor : public Actor {
+public:
+    explicit SignalActor(std::shared_ptr<std::promise<void>> p) : p_(std::move(p)) {}
+protected:
+    void configure() override {
+        on<Signal>([this](Signal&) { p_->set_value(); });
+    }
+private:
+    std::shared_ptr<std::promise<void>> p_;
+};
+}  // namespace
+
+TEST(ActorSystemTest, StopRightAfterHandlerDoesNotHang) {
+    auto cycles = std::async(std::launch::async, [] {
+        for (int i = 0; i < 4000; ++i) {
+            ActorSystem sys(2);
+            auto done = std::make_shared<std::promise<void>>();
+            auto fut = done->get_future();
+            auto id = sys.spawn<SignalActor>(done);
+            sys.start();
+            sys.send<Signal>(id, Signal{i});
+            fut.wait();  // the worker is now returning to wait()...
+            sys.stop();  // ...which is where the shutdown wakeup got lost
+        }
+    });
+    if (cycles.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+        // The hung thread can never be joined (the future's destructor would
+        // block too), so report and exit instead of hanging the test run.
+        std::fprintf(stderr, "FAILED: ActorSystem::stop() hung (lost shutdown wakeup)\n");
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    cycles.get();
 }
 
 TEST(ActorSystemTest, SpawnActors) {
