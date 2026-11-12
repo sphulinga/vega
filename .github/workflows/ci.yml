@@ -15,6 +15,8 @@ jobs:
   build-and-test:
     name: build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hung test must fail fast, not burn GitHub's 6-hour job limit.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -44,13 +46,14 @@ jobs:
 
       - name: C++ tests (ctest)
         working-directory: build-release
-        run: ctest --output-on-failure
+        # Per-test limit: a hang fails in minutes and names the stuck test.
+        run: ctest --output-on-failure --timeout 180
 
       - name: PyVega Python tests
         env:
           VEGA_SERVER: ${{ github.workspace }}/build-release/vega_server
           PYTHONPATH: ${{ github.workspace }}/python
-        run: python -m pytest python/tests/test_pyvega.py -q
+        run: python -m pytest python/tests -q
 
   wheel:
     # Builds the package exactly as PyPI users get it (scikit-build-core +
@@ -58,6 +61,7 @@ jobs:
     # standalone vega_server binary available.
     name: pip install . (py${{ matrix.python }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -87,6 +91,7 @@ jobs:
   pyspark-compat:
     name: PySpark RDD compatibility
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

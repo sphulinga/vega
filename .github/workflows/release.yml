@@ -81,6 +81,8 @@ jobs:
     name: Wheels (${{ matrix.name }})
     needs: check-version
     runs-on: ${{ matrix.os }}
+    # Builds and tests 5 Python versions; normally under 10 minutes.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

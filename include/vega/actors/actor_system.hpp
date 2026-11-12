@@ -202,7 +202,16 @@ public:
     }
 
     void stop() {
-        if (!running_.exchange(false)) return;
+        {
+            // Flip `running_` while holding the ready-queue mutex. Workers
+            // evaluate the wait predicate under this mutex, so each one either
+            // sees running_ == false or is already blocked in wait() and gets
+            // the notify below. Without the lock, a worker that had just found
+            // the predicate false could miss the notify and sleep forever,
+            // hanging join() (seen as a 6-hour CI hang on macOS).
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (!running_.exchange(false)) return;
+        }
         queue_cv_.notify_all();
         for (auto& t : threads_) {
             if (t.joinable()) t.join();
