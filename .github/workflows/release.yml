@@ -89,7 +89,10 @@ jobs:
         include:
           - { name: linux-x86_64, os: ubuntu-latest, archs: x86_64 }
           - { name: linux-aarch64, os: ubuntu-24.04-arm, archs: aarch64 }
-          - { name: macos-arm64, os: macos-14, archs: arm64 }
+          # Pinned macOS versions get retired (macos-14 was removed on
+          # 2026-11-02: its jobs are cancelled without a runner). Wheels still
+          # target macOS 11+ via MACOSX_DEPLOYMENT_TARGET in pyproject.toml.
+          - { name: macos-arm64, os: macos-15, archs: arm64 }
           # Intel macOS runner image; update the label when GitHub retires it.
           - { name: macos-x86_64, os: macos-15-intel, archs: x86_64 }
     steps:
