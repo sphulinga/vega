@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
+## [1.1.0] - 2026-11-17
+
+### Fixed
+- **Intermittent hang on shutdown.** `ActorSystem::stop()` could block forever
+  in `join()`: it cleared its running flag without holding the ready-queue
+  mutex, so a worker could miss the shutdown wakeup and sleep forever. Any
+  `SparkContext` (C++ or the PyVega session server) could hit this when
+  stopping; it hung a CI run for 6 hours on macOS. The flag is now changed
+  under the mutex, with a regression test that stops right after a handler
+  unblocks the caller.
+
+### Changed
+- Release workflow accepts tags with or without a leading `v` (`v1.2.3` or
+  `1.2.3`, including pre-releases such as `1.2.3rc1`); the 1.0.0 release was
+  tagged `1.0.0`, which did not trigger publishing.
+- CI: every job has a time limit and each C++ test a 3-minute limit, so a hang
+  fails fast and names the stuck test; the `build & test` job now runs the
+  whole Python suite (`test_spark_api.py` was skipped there). Wheel jobs in
+  the release workflow are capped at 60 minutes.
+- `docs/releasing.md`: trusted-publisher setup for the existing `pyvega` PyPI
+  project and how to recover from an `invalid-publisher` error.
+
 ## [1.0.0] - 2026-11-05
 
 ### Added
