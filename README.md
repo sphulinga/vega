@@ -74,6 +74,86 @@ measurement noise: for example, 240 isolated `groupByKey` runs per version
 gave a fastest time of 8.5 ms for both, and a median of 11.2 ms (v1.0.0)
 versus 10.4 ms (v1.1.0).
 
+### Compared with Apache Spark
+
+Two like-for-like comparisons with Apache Spark 4.3.0, on the same machine
+(Spark: Scala 2.13, Java 21, `local[4]`; Vega: 4 worker threads; 8 partitions
+on both). Each pair runs the same operations on the same data, and every
+operation reports its result (a count or sum): the results matched exactly
+between the two engines in every run, so both sides did identical work.
+Both sides get one untimed warm-up pass (the JVM's JIT needs it), then each
+cell is the best of 3 repetitions over 5 runs (3 at the larger size), with
+runs alternating between the two engines.
+
+**Native APIs: Vega's C++ API vs Spark's Scala RDD API.** Only the operations
+Vega's C++ API offers ([`benchmarks/vega_cpp_ops.cpp`](benchmarks/vega_cpp_ops.cpp)
+and [`benchmarks/spark_scala_ops.scala`](benchmarks/spark_scala_ops.scala);
+data: `(i % 1000, i)` pairs and integers):
+
+| Operation | Vega C++, 1M (ms) | Spark Scala, 1M (ms) | Vega C++ vs Spark Scala | Vega C++, 10M (ms) | Spark Scala, 10M (ms) | Vega C++ vs Spark Scala |
+|---|---:|---:|---:|---:|---:|---:|
+| parallelize+collect (pairs) | 5.2 | 340.5 | 65× faster | 170.5 | 5059.0 | 30× faster |
+| map+filter (pairs) | 1.1 | 205.2 | 188× faster | 42.3 | 3592.4 | 85× faster |
+| flatMap x3 (ints) | 2.9 | 41.6 | 14× faster | 30.6 | 272.0 | 8.9× faster |
+| reduce sum (ints) | 2.0 | 19.9 | 10× faster | 24.7 | 116.8 | 4.7× faster |
+| reduceByKey (pairs) | 8.0 | 249.1 | 31× faster | 215.9 | 3384.5 | 16× faster |
+| groupByKey (pairs) | 7.8 | 313.1 | 40× faster | 212.1 | 4043.5 | 19× faster |
+| chained shuffle | 8.3 | 268.4 | 32× faster | 211.1 | 3362.9 | 16× faster |
+| narrow pipeline (ints) | 1.5 | 32.3 | 22× faster | 19.8 | 190.3 | 9.6× faster |
+
+**Python APIs: PyVega vs PySpark.** The same Python code runs on both
+([`benchmarks/bench_python_ops.py`](benchmarks/bench_python_ops.py)
+`--engine pyvega|pyspark`):
+
+| Operation | PyVega, 200k (ms) | PySpark, 200k (ms) | PyVega vs PySpark | PyVega, 2M (ms) | PySpark, 2M (ms) | PyVega vs PySpark |
+|---|---:|---:|---:|---:|---:|---:|
+| parallelize+collect (tuples) | 111.9 | 63.9 | 1.8× slower | 1546.4 | 461.2 | 3.4× slower |
+| map+filter python (tuples) | 30.5 | 65.7 | 2.2× faster | 376.6 | 177.5 | 2.1× slower |
+| reduceByKey (tuples) | 11.7 | 210.9 | 18× faster | 121.9 | 330.8 | 2.7× faster |
+| groupByKey (tuples) | 8.6 | 173.7 | 20× faster | 101.1 | 363.9 | 3.6× faster |
+| distinct (strings) | 42.5 | 234.2 | 5.5× faster | 438.0 | 361.7 | 1.2× slower |
+| sortByKey (tuples) | 53.0 | 305.9 | 5.8× faster | 648.9 | 874.8 | 1.3× faster |
+| mapPartitions | 5.9 | 55.5 | 9.4× faster | 67.1 | 105.2 | 1.6× faster |
+| union x2 † | 0.38 | 82.8 | 218× faster | 0.42 | 164.7 | 392× faster |
+| repartition(16) | 3.5 | 227.2 | 65× faster | 47.5 | 555.5 | 12× faster |
+| aggregateByKey | 20.6 | 204.8 | 9.9× faster | 213.9 | 330.0 | 1.5× faster |
+| take(10) | 1.3 | 12.2 | 9.3× faster | 10.6 | 16.4 | 1.5× faster |
+| first() | 1.2 | 12.6 | 10× faster | 9.6 | 17.1 | 1.8× faster |
+| sum (ints) | 1.4 | 41.2 | 29× faster | 12.1 | 55.1 | 4.5× faster |
+| aggregate | 20.5 | 50.9 | 2.5× faster | 224.2 | 126.1 | 1.8× slower |
+| chained shuffle | 12.1 | 324.0 | 27× faster | 124.5 | 451.1 | 3.6× faster |
+
+How to read these:
+
+- **Single machine, in-memory data.** Spark is built for fault-tolerant
+  clusters: it schedules every job as distributed tasks, serializes records,
+  and always writes shuffle data to local disk. Vega runs in one process and
+  shuffles in memory, with no serialization or disk I/O. Spark scales out to a cluster; Vega's
+  Python API does not yet. The gap narrows as data grows, as Spark's fixed
+  per-job costs are spread over more records.
+- **Native gaps are largest on tuples.** Spark's JVM stores each `(Int,
+  Double)` pair as a boxed object; Vega's C++ API stores a plain 16-byte
+  struct.
+- **PySpark wins Python-heavy work at larger sizes.** PySpark runs Python
+  functions in one worker process per core, while PyVega runs them in a
+  single interpreter, effectively on one core because of the GIL. At 2M
+  elements that makes PySpark faster on `map+filter`, `distinct` and
+  `aggregate`. `parallelize+collect` favours PySpark at both sizes because
+  PyVega converts every element in Python on the client.
+- **† `union x2` is not the same work.** PyVega answers `count()` on a union
+  of in-memory collections from stored partition sizes without touching any
+  element; PySpark iterates them.
+
+To reproduce (`pip install pyspark` provides Spark, which needs Java 17+):
+
+```bash
+cmake --build build-release --target vega_cpp_ops
+python benchmarks/bench_native_ops.py --engine vega-cpp --json vega_cpp.json
+python benchmarks/bench_native_ops.py --engine spark-scala --json spark_scala.json
+python benchmarks/bench_python_ops.py --engine pyvega --warmup 1 --json pyvega.json
+python benchmarks/bench_python_ops.py --engine pyspark --warmup 1 --json pyspark.json
+```
+
 Where the gains come from:
 
 - **Everything runs on the server.** `distinct`, `union`, `partitionBy`,
