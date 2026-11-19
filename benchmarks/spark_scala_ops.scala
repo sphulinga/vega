@@ -1,67 +1,65 @@
-// Apache Spark (Scala RDD API) counterpart of benchmarks/bench_pyvega_ops.py.
+// Apache Spark (Scala RDD API) counterpart of benchmarks/vega_cpp_ops.cpp.
 //
-// Same datasets, sizes, partition counts and operations, so the results can be
-// put side by side with PyVega's. Run it through bench_spark_scala_ops.py, or
-// directly with:
+// The same operations, datasets, element types and partitioning as Vega's C++
+// benchmark, so the two native APIs are compared like for like. Run it
+// through bench_spark_scala_ops.py, or directly with:
 //
-//   BENCH_N=200000 BENCH_REPEAT=3 spark-shell --master "local[4]" \
+//   BENCH_N=1000000 BENCH_REPEAT=3 spark-shell --master "local[4]" \
 //     --conf spark.ui.enabled=false -i benchmarks/spark_scala_ops.scala
 //
-// Prints one "RESULT\t<operation>\t<best ms>" line per operation.
+// Prints one "RESULT\t<operation>\t<best ms>\t<result>" line per operation;
+// the result (a count or sum) lets the runner check that both engines did the
+// same work.
 
-val n = sys.env.getOrElse("BENCH_N", "200000").toInt
+val n = sys.env.getOrElse("BENCH_N", "1000000").toInt
 val repeat = sys.env.getOrElse("BENCH_REPEAT", "3").toInt
-val parts = 8
+val warmup = sys.env.getOrElse("BENCH_WARMUP", "1").toInt
+val parts = sys.env.getOrElse("BENCH_PARTITIONS", "8").toInt
 
 sc.setLogLevel("WARN")
 
+// Same datasets as vega_cpp_ops.cpp: (i % 1000, i) pairs and ints.
 val objs: Seq[(Int, Double)] = (0 until n).map(i => (i % 1000, i.toDouble))
-val words: Seq[String] = (0 until n).map(i => s"w${i % 5000}")
 val nums: Seq[Long] = (0 until n).map(_.toLong)
 val pairs = sc.parallelize(objs, parts)
-val wrdd = sc.parallelize(words, parts)
 val nrdd = sc.parallelize(nums, parts)
 
-// Best wall time over `repeat` runs, in milliseconds (same as _best() in the
-// Python benchmark: the first run is not discarded separately).
-def best(f: () => Any): Double = {
+// Best wall time over `repeat` runs, in milliseconds, plus the last result.
+def best(f: () => Long): (Double, Long) = {
   var bestNs = Long.MaxValue
+  var result = 0L
   for (_ <- 0 until repeat) {
     val t0 = System.nanoTime()
-    f()
+    result = f()
     bestNs = math.min(bestNs, System.nanoTime() - t0)
   }
-  bestNs / 1e6
+  (bestNs / 1e6, result)
 }
 
-val cases: Seq[(String, () => Any)] = Seq(
-  "parallelize+collect (tuples)" -> (() => sc.parallelize(objs, parts).collect()),
-  "map+filter python (tuples)" -> (() =>
+val cases: Seq[(String, () => Long)] = Seq(
+  "parallelize+collect (pairs)" -> (() => sc.parallelize(objs, parts).collect().length.toLong),
+  "map+filter (pairs)" -> (() =>
     pairs.map(kv => (kv._1, kv._2 * 2)).filter(kv => kv._1 % 2 == 0).count()),
-  "reduceByKey (tuples)" -> (() => pairs.reduceByKey(_ + _).count()),
-  "groupByKey (tuples)" -> (() => pairs.groupByKey().count()),
-  "distinct (strings)" -> (() => wrdd.distinct().count()),
-  "sortByKey (tuples)" -> (() => pairs.sortByKey().count()),
-  "mapPartitions" -> (() => pairs.mapPartitions(it => it).count()),
-  "union x2" -> (() => sc.union(pairs, pairs).count()),
-  "repartition(16)" -> (() => pairs.repartition(16).count()),
-  "aggregateByKey" -> (() => pairs.aggregateByKey(0.0)(_ + _, _ + _).count()),
-  "take(10)" -> (() => pairs.map(kv => kv).take(10)),
-  "first()" -> (() => pairs.map(kv => kv).first()),
-  "sum (ints)" -> (() => nrdd.sum()),
-  "aggregate" -> (() => pairs.aggregate(0.0)((a, kv) => a + kv._2, _ + _)),
+  "flatMap x3 (ints)" -> (() => nrdd.flatMap(x => Seq(x, x + 1, x + 2)).count()),
+  "reduce sum (ints)" -> (() => nrdd.reduce(_ + _)),
+  "reduceByKey (pairs)" -> (() => pairs.reduceByKey(_ + _).count()),
+  "groupByKey (pairs)" -> (() => pairs.groupByKey().count()),
   "chained shuffle" -> (() =>
-    pairs.reduceByKey(_ + _).map(kv => (kv._1 % 10, kv._2)).groupByKey().count())
+    pairs.reduceByKey(_ + _).map(kv => (kv._1 % 10, kv._2)).groupByKey().count()),
+  "narrow pipeline (ints)" -> (() =>
+    nrdd.map(x => (x * 31L + 7L) % 1000003L)
+      .filter(x => x % 7L == 0L)
+      .flatMap(x => Seq(x, x + 1L, x + 2L))
+      .count())
 )
 
 // Warm-up pass: the JVM's JIT compiler speeds code up over its first
-// executions, so run every operation untimed first and report Spark at its
-// best. (PyVega needs no equivalent: CPython has no JIT warm-up.)
-val warmup = sys.env.getOrElse("BENCH_WARMUP", "1").toInt
+// executions, so run every operation untimed first (vega_cpp_ops does the
+// same).
 for (_ <- 0 until warmup; (_, f) <- cases) f()
 
 for ((name, f) <- cases) {
-  val ms = best(f)
-  println(f"RESULT\t$name\t$ms%.3f")
+  val (ms, result) = best(f)
+  println(f"RESULT\t$name\t$ms%.3f\t$result")
 }
 System.exit(0)
