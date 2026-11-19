@@ -46,25 +46,33 @@ with SparkContext(4) as sc:
 ## Performance
 
 Measured with [`benchmarks/bench_pyvega_ops.py`](benchmarks/bench_pyvega_ops.py)
-(best of 3, Linux, 4 cores, 4 workers):
+on one machine (Linux, 4 vCPU Intel Xeon @ 2.3 GHz, 4 workers). Each version
+was built from its release tag and run with its own client and server; runs
+were interleaved across versions, and each cell is the best time over 8 runs.
 
-| Operation (200k elements, 4 workers) | v0.5.0 (ms) | v0.6.0 (ms) | Speedup |
-|---|---:|---:|---:|
-| parallelize+collect (tuples) | 207.7 | 139.9 | 1.5x |
-| map+filter python (tuples) | 184.6 | 45.3 | 4.1x |
-| reduceByKey (tuples) | 107.8 | 16.5 | 6.5x |
-| groupByKey (tuples) | 107.9 | 12.3 | 8.8x |
-| distinct (strings) | 4092.0 | 62.5 | 65x |
-| sortByKey (tuples) | 688.0 | 81.5 | 8.4x |
-| mapPartitions | 207.8 | 8.7 | 24x |
-| union x2 | 408.0 | 0.4 | 949x |
-| repartition(16) | 232.0 | 3.9 | 60x |
-| aggregateByKey | 172.0 | 29.4 | 5.8x |
-| take(10) | 142.2 | 1.6 | 89x |
-| first() | 148.5 | 1.5 | 98x |
-| sum (ints) | 123.9 | 1.8 | 68x |
-| aggregate | 72.5 | 32.7 | 2.2x |
-| chained shuffle | failed | 33.2 | fixed |
+| Operation (200k elements, 4 workers) | v0.5.0 (ms) | v1.0.0 (ms) | v1.1.0 (ms) | v1.1.0 vs v0.5.0 |
+|---|---:|---:|---:|---:|
+| parallelize+collect (tuples) | 117.4 | 108.7 | 106.4 | 1.1x |
+| map+filter python (tuples) | 188.0 | 30.6 | 30.4 | 6.2x |
+| reduceByKey (tuples) | 103.8 | 11.8 | 11.7 | 8.9x |
+| groupByKey (tuples) | 103.3 | 8.7 | 10.0 | 10x |
+| distinct (strings) | 2844.0 | 42.4 | 42.6 | 67x |
+| sortByKey (tuples) | 568.1 | 52.3 | 55.4 | 10x |
+| mapPartitions | 180.1 | 5.9 | 5.7 | 32x |
+| union x2 | 307.9 | 0.3 | 0.3 | 906x |
+| repartition(16) | 171.8 | 2.8 | 3.0 | 57x |
+| aggregateByKey | 156.0 | 20.1 | 22.9 | 6.8x |
+| take(10) | 119.3 | 1.4 | 1.2 | 97x |
+| first() | 114.8 | 1.2 | 1.1 | 102x |
+| sum (ints) | 107.2 | 1.3 | 1.3 | 81x |
+| aggregate | 55.2 | 20.3 | 20.9 | 2.6x |
+| chained shuffle | failed | 12.0 | 11.9 | fixed |
+
+v1.1.0 only changed the shutdown path (`ActorSystem::stop()`), so it performs
+the same as v1.0.0. Differences of 10-15% between them in this table are
+measurement noise: for example, 240 isolated `groupByKey` runs per version
+gave a fastest time of 8.5 ms for both, and a median of 11.2 ms (v1.0.0)
+versus 10.4 ms (v1.1.0).
 
 Where the gains come from:
 
