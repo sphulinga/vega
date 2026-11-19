@@ -59,6 +59,9 @@ VEGA_SERVER=build-release/vega_server \
 
 Benchmarks: `python benchmarks/bench_pyvega_ops.py --json out.json` times common
 operations; run it before and after a performance change.
+`python benchmarks/bench_spark_scala_ops.py --json spark.json` runs the same
+operations on Apache Spark's Scala RDD API (needs Java 17+ and
+`pip install pyspark`, which bundles Spark).
 
 Releases: see [docs/releasing.md](docs/releasing.md).
 
