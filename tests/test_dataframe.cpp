@@ -202,7 +202,7 @@ TEST_F(DataFrameTest, Join) {
     auto stores = DataFrame::from_columns(ctx, {{"store", Column(sid)}, {"region", Column(region)}}, 2);
     auto joined = sales_df(ctx, s, 4).join(stores, {"store"});
     EXPECT_EQ(schema_string(joined.schema()),
-              "[id: bigint, store: bigint, qty: bigint, price: double, category: string, region: string]");
+              "[store: bigint, id: bigint, qty: bigint, price: double, category: string, region: string]");
     Batch b = joined.collect();
     std::multiset<std::pair<int64_t, std::string>> want, got;
     for (size_t i = 0; i < s.id.size(); ++i)
