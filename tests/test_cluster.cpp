@@ -1,3 +1,4 @@
+#include <atomic>
 #include <string>
 #include <thread>
 
@@ -9,6 +10,15 @@
 #include <vega/network/message_codec.hpp>
 #include <vega/cluster/node.hpp>
 #include <vega/cluster/gossip.hpp>
+#include <vega/vega.hpp>
+#include <vega/cluster/cluster.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <future>
+#include <map>
+#include <unistd.h>
 
 using namespace vega;
 
@@ -25,7 +35,7 @@ TEST(EndpointTest, ToString) {
 
 TEST(TcpTest, SendReceiveFrame) {
     ByteBuffer received;
-    bool got_data = false;
+    std::atomic<bool> got_data{false};
 
     net::TcpServer server("127.0.0.1", 0,
         [&](std::unique_ptr<net::TcpConnection> conn) {
@@ -154,4 +164,59 @@ TEST(GossipTest, HandlePingMergesNodes) {
     EXPECT_TRUE(joined);
     EXPECT_EQ(gossip.live_count(), 2u);
     EXPECT_EQ(gossip.live_workers().size(), 2u);
+}
+
+// End-to-end P2P cluster: three peers in one process, talking over real
+// localhost TCP, run the same program (SPMD) -- scatter from peer 0, a
+// narrow job and a shuffle job -- then all stop. Each step used to hang:
+// non-root peers ignored scattered data, messages from faster peers that
+// arrived before a slower peer reached the job were dropped, and stop()
+// waited for remote peers to close their connections.
+TEST(ClusterTest, ThreePeersScatterCollectAndShuffle) {
+    const uint16_t base = static_cast<uint16_t>(20000 + (::getpid() % 4000) * 3);
+    struct Out {
+        std::vector<int> doubled;
+        std::map<int, int> counts;
+    };
+    auto peer = [base](int i) {
+        ClusterConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = static_cast<uint16_t>(base + i);
+        cfg.node_id = "peer-" + std::to_string(i);
+        cfg.expected_peers = 3;
+        if (i > 0) cfg.seed_nodes.push_back(net::Endpoint{"127.0.0.1", base});
+        Cluster c(cfg);
+        if (!c.wait_for_peers(std::chrono::seconds(30))) throw std::runtime_error("peers did not join");
+        std::vector<int> data;
+        if (c.my_index() == 0)
+            for (int x = 0; x < 1000; ++x) data.push_back(x);
+        auto rdd = c.scatter(data, 6);
+        Out out;
+        out.doubled = c.collect(rdd.map([](const int& x) { return x * 2; }));
+        auto pairs = c.collect(rdd.map([](const int& x) { return std::make_pair(x % 10, 1); })
+                                   .reduceByKey([](const int& a, const int& b) { return a + b; }));
+        for (auto& [k, v] : pairs) out.counts[k] = v;
+        c.stop();
+        return out;
+    };
+    std::vector<std::future<Out>> futures;
+    for (int i = 0; i < 3; ++i) {
+        futures.push_back(std::async(std::launch::async, peer, i));
+        std::this_thread::sleep_for(std::chrono::milliseconds(i == 0 ? 200 : 50));
+    }
+    for (auto& f : futures) {
+        if (f.wait_for(std::chrono::seconds(90)) != std::future_status::ready) {
+            ADD_FAILURE() << "cluster job hung";
+            std::_Exit(1);  // threads are stuck; do not wait for them
+        }
+    }
+    std::vector<int> want;
+    for (int x = 0; x < 1000; ++x) want.push_back(2 * x);
+    for (auto& f : futures) {
+        Out o = f.get();
+        std::sort(o.doubled.begin(), o.doubled.end());
+        EXPECT_EQ(o.doubled, want);  // every peer gets the whole result
+        ASSERT_EQ(o.counts.size(), 10u);
+        for (auto& [k, v] : o.counts) EXPECT_EQ(v, 100) << "key " << k;
+    }
 }

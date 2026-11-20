@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
+## [Unreleased]
+
+### Fixed
+- **Multi-process C++ cluster mode (`vega::Cluster`) works end to end.** A job
+  across several processes used to hang or return incomplete results:
+  - Peers other than the root ignored scattered data and computed empty
+    partitions.
+  - A slower peer dropped shuffle blocks, map-done signals and results that
+    faster peers sent before it reached the job.
+  - `stop()` waited for remote peers to close their connections.
+
+  Early messages are now buffered or recorded until the job reaches them.
+  `scatter` sends every partition to its owner, and owners wait for theirs.
+  The router unblocks its connection threads on `stop()`. A new test runs
+  scatter, a narrow job and a shuffle job on three peers over localhost TCP.
+- `cluster_word_count` now counts words in cluster mode; it used to only
+  collect the input lines.
+
+### Changed
+- `Cluster::scatter` takes the root peer's index (default 0) and a timeout.
+- README and `docs/server-and-workers.md`: cluster mode is documented as SPMD
+  (every peer runs the same program), with its limits. `vega_worker` only joins
+  gossip and cannot run jobs, and must not join a cluster that does.
+
 ## [2.0.0] - 2026-11-20
 
 A major release for the new native C++ DataFrame API. No existing C++ RDD or

@@ -11,6 +11,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -66,15 +67,18 @@ public:
 
     void start() {
         if (running_.exchange(true)) return;
-        accept_thread_ = std::thread(&TcpServer::accept_loop, this);
+        accept_thread_ = std::thread(&TcpServer::accept_loop, this, listen_fd_);
     }
 
+    // The accept thread polls with a short timeout and checks running_, so
+    // it exits on its own; the descriptor is closed only after it has been
+    // joined, so it never sees the fd closed or reused. (shutdown() on a
+    // listening socket wakes accept() on Linux but not on macOS.)
     void stop() {
         if (!running_.exchange(false)) return;
-        ::shutdown(listen_fd_, SHUT_RDWR);
+        if (accept_thread_.joinable()) accept_thread_.join();
         ::close(listen_fd_);
         listen_fd_ = -1;
-        if (accept_thread_.joinable()) accept_thread_.join();
         for (auto& t : conn_threads_)
             if (t.joinable()) t.join();
         conn_threads_.clear();
@@ -88,13 +92,19 @@ private:
     std::thread accept_thread_;
     std::vector<std::thread> conn_threads_;
 
-    void accept_loop() {
+    void accept_loop(int listen_fd) {
         while (running_.load()) {
+            struct pollfd pfd{listen_fd, POLLIN, 0};
+            const int ready = ::poll(&pfd, 1, 100);
+            if (ready <= 0) continue;  // timeout (re-check running_) or EINTR
             struct sockaddr_in peer{};
             socklen_t plen = sizeof(peer);
-            int fd = ::accept(listen_fd_,
+            int fd = ::accept(listen_fd,
                               reinterpret_cast<sockaddr*>(&peer), &plen);
-            if (fd < 0) break;
+            if (fd < 0) {
+                if (!running_.load()) break;
+                continue;  // e.g. ECONNABORTED
+            }
             auto conn = std::make_unique<TcpConnection>(fd);
             conn_threads_.emplace_back(
                 [this, c = std::move(conn)]() mutable {

@@ -54,7 +54,7 @@ python -c "from pyvega import SparkContext; \
 ```
 
 - **Client workers** (`SparkContext(4)`) → worker *threads* inside `vega_server`, not separate OS processes.
-- **`vega_worker`** → separate cluster *peers* for multi-node C++ jobs (not used by PyVega today).
+- **`vega::Cluster`** → multi-node C++ jobs: every peer runs the same program (not used by PyVega today). The `vega_worker` daemon only joins gossip membership.
 - **Transformations** are batched client-side and sent on the first action to minimize RPC round-trips.
 
 ## C++ and cluster docs

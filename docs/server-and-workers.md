@@ -121,30 +121,35 @@ the lambda pattern (`pyvega._native.try_compile`).
 
 ### What it does
 
-`vega_worker` runs a **decentralized peer** that participates in multi-node C++
-execution. Peers discover each other via **gossip** and coordinate jobs without a
-central Spark-style driver.
+Multi-node C++ programs use `vega::Cluster` (`include/vega/cluster/cluster.hpp`).
+Peers discover each other via **gossip** and coordinate jobs without a central
+Spark-style driver. Every peer runs **the same program** (SPMD):
 
-PyVega does **not** submit jobs to cluster peers yet; use this for C++ cluster
-examples and experiments.
+1. One peer `scatter`s the input.
+2. Each peer computes the partitions it owns (partition `p` belongs to peer
+   `p % n`).
+3. Shuffle blocks and results go directly between peers.
+4. `collect` returns the full result on every peer.
+
+`vega_worker` is a standalone peer daemon that only joins the gossip
+membership. It **cannot run jobs**, because C++ closures can't be shipped to
+another process. Don't let it join a cluster that runs jobs: partitions would
+be assigned to it and the job would stall.
+
+PyVega does **not** submit jobs to cluster peers yet.
 
 ### Starting peers locally (three terminals)
 
 ```bash
-# Terminal 1
-./build-release/vega_worker --bind 127.0.0.1:9001 --id peer-1
-
-# Terminal 2
-./build-release/vega_worker --bind 127.0.0.1:9002 --id peer-2 \
-  --seeds 127.0.0.1:9001
-
-# Terminal 3 — run the cluster word-count example
-./build-release/examples/cluster_word_count \
-  --bind 127.0.0.1:9003 --id peer-3 \
+./build-release/examples/cluster_word_count --bind 127.0.0.1:9001 --id peer-1 --expect-peers 3
+./build-release/examples/cluster_word_count --bind 127.0.0.1:9002 --id peer-2 \
+  --seeds 127.0.0.1:9001 --expect-peers 3
+./build-release/examples/cluster_word_count --bind 127.0.0.1:9003 --id peer-3 \
   --seeds 127.0.0.1:9001 --expect-peers 3
 ```
 
-All nodes run the **same binary**; the submitter is not a special "driver" role.
+All peers run the **same binary**. Peer 1 prints the word counts, and then all
+three exit.
 
 ### Peer flags
 
@@ -153,10 +158,16 @@ All nodes run the **same binary**; the submitter is not a special "driver" role.
 | `--bind HOST:PORT` | Listen address for this peer |
 | `--seeds H1:P1,H2:P2` | Seed peers for gossip discovery |
 | `--id NAME` | Node id (default: `peer-<port>`) |
-| `--expect-peers N` | Block until N peers are visible (submitter examples) |
+| `--expect-peers N` | Block until N peers are visible |
 
 Legacy flags `--driver`, `--worker`, and `--expect-workers` are accepted but ignored;
 see `ClusterConfig::from_args` in `include/vega/cluster/cluster.hpp`.
+
+### Limits
+
+- **One shuffle per job.** A job may contain at most one shuffle.
+- **Data stays in memory.** Nothing is written to disk.
+- **No fault tolerance.** A peer that dies stalls the job.
 
 ### Single-node C++ without cluster
 
@@ -173,7 +184,7 @@ see `ClusterConfig::from_args` in `include/vega/cluster/cluster.hpp`.
 |------|-----|
 | Python / PySpark RDD scripts | `vega_server` + PyVega |
 | Upstream PySpark RDD test suite | `vega_server` + `scripts/pyspark_compat` |
-| Multi-node C++ benchmarks | `vega_worker` peers + cluster examples |
+| Multi-node C++ jobs | `vega::Cluster` programs (every peer runs the same binary) |
 | Production Python deployment | Long-running `vega-server`, clients use `remote=` |
 
 ---
@@ -200,5 +211,5 @@ C++ cluster (no Python)
 =======================
  peer-1 ◄──gossip──► peer-2 ◄──gossip──► peer-3
    │                    │                  │
-   └──────── partition tasks over TCP ─────┘
+   └─── scattered data, shuffle blocks and results over TCP ───┘
 ```

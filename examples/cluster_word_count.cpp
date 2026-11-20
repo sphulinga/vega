@@ -121,15 +121,24 @@ static void run_cluster(int argc, char** argv) {
 
     auto rdd = cluster.scatter(my_data, p.size());
 
-    // Collect: each peer computes its own partitions, no central driver.
-    auto result = cluster.collect(rdd);
+    // Word count: map side on each peer's partitions, shuffle blocks sent
+    // directly between peers, reduce on the owner -- no central driver.
+    auto counts = cluster.collect(
+        rdd.flatMap([](const std::string& line) { return split_words(line); })
+            .map([](const std::string& word) -> std::pair<std::string, int> {
+                return {word, 1};
+            })
+            .reduceByKey([](int a, int b) { return a + b; }));
+    std::sort(counts.begin(), counts.end(), [](auto& a, auto& b) {
+        return a.second != b.second ? a.second > b.second : a.first < b.first;
+    });
 
-    // Only peer-0 prints the result (arbitrary -- any peer could).
+    // Every peer has the full result; peer-0 prints it (any peer could).
     if (cluster.my_index() == 0) {
         std::cout << "\n=== Distributed word count (" << p.size()
                   << " peers, P2P) ===\n\n";
-        for (auto& word : result)
-            std::cout << "  " << word << "\n";
+        for (auto& [word, count] : counts)
+            std::cout << "  " << word << ": " << count << "\n";
     }
 
     cluster.stop();

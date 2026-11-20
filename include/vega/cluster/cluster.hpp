@@ -191,12 +191,16 @@ public:
 
     // -----------------------------------------------------------------------
     // scatter: distribute data from one peer to all peers.
-    // Only the peer that HAS data calls this with non-empty data.
+    // Every peer calls it (SPMD); only the peer at index `root` in the sorted
+    // peer list provides `data` (the others' argument is ignored). Each peer
+    // ends up holding the partitions it owns (partition p -> peer p % n),
+    // waiting up to `timeout` for them to arrive.
     // -----------------------------------------------------------------------
 
     template<typename T>
     RDD<T> scatter(const std::vector<T>& data,
-                   size_t num_partitions = 0);
+                   size_t num_partitions = 0, size_t root = 0,
+                   std::chrono::seconds timeout = std::chrono::seconds(60));
 
     // -----------------------------------------------------------------------
     // collect: all peers participate in distributed execution.
@@ -282,14 +286,18 @@ private:
     // -- Partition data receive (for scatter) --------------------------------
 
     std::mutex local_data_mu_;
+    std::condition_variable local_data_cv_;
     std::unordered_map<std::string, ByteBuffer> local_partitions_;
 
     void handle_partition_data(const std::string&, const ByteBuffer& body) {
         size_t off = 0;
         auto key = Serializer<std::string>::deserialize(body, off);
         ByteBuffer data(body.begin() + off, body.end());
-        std::lock_guard<std::mutex> lock(local_data_mu_);
-        local_partitions_[key] = std::move(data);
+        {
+            std::lock_guard<std::mutex> lock(local_data_mu_);
+            local_partitions_[key] = std::move(data);
+        }
+        local_data_cv_.notify_all();
     }
 
     // -- Shuffle block receive (P2P) ----------------------------------------
@@ -297,6 +305,19 @@ private:
     // Active shuffle RDD for the current job (set before shuffle starts).
     std::mutex active_shuffle_mu_;
     std::unordered_map<size_t, std::shared_ptr<RDDBase>> active_shuffle_rdds_;
+    // Blocks that arrived before this peer reached the job (peers run at
+    // different speeds); replayed when the job registers its shuffle RDD.
+    std::unordered_map<size_t, std::vector<std::pair<size_t, ByteBuffer>>> pending_blocks_;
+
+    void register_shuffle(size_t job_id, const std::shared_ptr<RDDBase>& rdd) {
+        std::lock_guard<std::mutex> lock(active_shuffle_mu_);
+        active_shuffle_rdds_[job_id] = rdd;
+        auto it = pending_blocks_.find(job_id);
+        if (it != pending_blocks_.end()) {
+            for (auto& [pid, block] : it->second) rdd->receive_shuffle_data(pid, block);
+            pending_blocks_.erase(it);
+        }
+    }
 
     void handle_shuffle_block(const std::string&, const ByteBuffer& body) {
         size_t off = 0;
@@ -304,32 +325,39 @@ private:
         auto reduce_pid = read_pod<uint64_t>(body, off);
         ByteBuffer block(body.begin() + off, body.end());
 
-        std::shared_ptr<RDDBase> shuffle_rdd;
-        {
-            std::lock_guard<std::mutex> lock(active_shuffle_mu_);
-            auto it = active_shuffle_rdds_.find(job_id);
-            if (it != active_shuffle_rdds_.end())
-                shuffle_rdd = it->second;
-        }
-        if (shuffle_rdd) {
-            shuffle_rdd->receive_shuffle_data(
-                static_cast<size_t>(reduce_pid), block);
-        }
+        // Hold the lock while delivering so a concurrent register_shuffle()
+        // cannot miss this block.
+        std::lock_guard<std::mutex> lock(active_shuffle_mu_);
+        auto it = active_shuffle_rdds_.find(job_id);
+        if (it != active_shuffle_rdds_.end())
+            it->second->receive_shuffle_data(static_cast<size_t>(reduce_pid), block);
+        else
+            pending_blocks_[job_id].emplace_back(static_cast<size_t>(reduce_pid), std::move(block));
     }
 
     // -- MAP_DONE barrier ----------------------------------------------------
+
+    // State for a job is created by whichever comes first: the local
+    // execution or a message from a faster peer.
+    std::shared_ptr<ShuffleBarrier> barrier_for(size_t job_id) {
+        std::lock_guard<std::mutex> lock(barriers_mu_);
+        auto& b = barriers_[job_id];
+        if (!b) b = std::make_shared<ShuffleBarrier>();
+        return b;
+    }
+
+    std::shared_ptr<GatherState> gather_for(size_t job_id) {
+        std::lock_guard<std::mutex> lock(gather_mu_);
+        auto& g = gathers_[job_id];
+        if (!g) g = std::make_shared<GatherState>();
+        return g;
+    }
 
     void handle_map_done(const std::string& sender, const ByteBuffer& body) {
         size_t off = 0;
         auto job_id = read_pod<uint64_t>(body, off);
 
-        std::shared_ptr<ShuffleBarrier> barrier;
-        {
-            std::lock_guard<std::mutex> lock(barriers_mu_);
-            auto it = barriers_.find(job_id);
-            if (it == barriers_.end()) return;
-            barrier = it->second;
-        }
+        std::shared_ptr<ShuffleBarrier> barrier = barrier_for(job_id);
         {
             std::lock_guard<std::mutex> lock(barrier->mu);
             barrier->done_peers.insert(sender);
@@ -347,26 +375,18 @@ private:
                          cfg_.node_id, body);
         }
         // Also mark self as done.
+        auto barrier = barrier_for(job_id);
         {
-            std::lock_guard<std::mutex> lock(barriers_mu_);
-            auto it = barriers_.find(job_id);
-            if (it != barriers_.end()) {
-                std::lock_guard<std::mutex> bl(it->second->mu);
-                it->second->done_peers.insert(cfg_.node_id);
-                it->second->cv.notify_all();
-            }
+            std::lock_guard<std::mutex> bl(barrier->mu);
+            barrier->done_peers.insert(cfg_.node_id);
+            barrier->cv.notify_all();
         }
     }
 
     void wait_for_map_done(size_t job_id, size_t expected) {
-        std::shared_ptr<ShuffleBarrier> barrier;
-        {
-            std::lock_guard<std::mutex> lock(barriers_mu_);
-            barrier = barriers_[job_id];
-        }
-        barrier->expected = expected;
-
+        std::shared_ptr<ShuffleBarrier> barrier = barrier_for(job_id);
         std::unique_lock<std::mutex> lock(barrier->mu);
+        barrier->expected = expected;
         barrier->cv.wait(lock, [&] {
             return barrier->done_peers.size() >= expected;
         });
@@ -380,13 +400,7 @@ private:
         auto partition_id = read_pod<uint64_t>(body, off);
         ByteBuffer data(body.begin() + off, body.end());
 
-        std::shared_ptr<GatherState> gs;
-        {
-            std::lock_guard<std::mutex> lock(gather_mu_);
-            auto it = gathers_.find(job_id);
-            if (it == gathers_.end()) return;
-            gs = it->second;
-        }
+        std::shared_ptr<GatherState> gs = gather_for(job_id);
         {
             std::lock_guard<std::mutex> lock(gs->mu);
             gs->blocks[static_cast<size_t>(partition_id)] = std::move(data);
@@ -428,53 +442,61 @@ private:
 
 template<typename T>
 RDD<T> Cluster::scatter(const std::vector<T>& data,
-                         size_t num_partitions) {
+                        size_t num_partitions, size_t root,
+                        std::chrono::seconds timeout) {
     auto np = num_peers();
     if (num_partitions == 0)
         num_partitions = np;
+    const bool is_root = my_index() == root;
 
-    // Partition the data.
-    std::vector<Partition<T>> all_parts(num_partitions, Partition<T>(0, {}));
-    size_t total = data.size();
-    size_t chunk = total > 0
-                   ? (total + num_partitions - 1) / num_partitions : 0;
+    std::vector<Partition<T>> all_parts;
+    all_parts.reserve(num_partitions);
+    for (size_t i = 0; i < num_partitions; ++i)
+        all_parts.emplace_back(i, std::vector<T>{});
 
-    for (size_t i = 0; i < num_partitions && i * chunk < total; ++i) {
-        size_t begin = i * chunk;
-        size_t end   = std::min(begin + chunk, total);
-        all_parts[i] = Partition<T>(i,
-            std::vector<T>(data.begin() + begin, data.begin() + end));
-    }
-
-    // Send each partition directly to the owning peer (P2P).
     auto sorted_peers = peers();
     size_t dist_id = next_job_id_.fetch_add(1, std::memory_order_relaxed);
+    auto key_of = [&](size_t p) { return std::to_string(dist_id) + ":" + std::to_string(p); };
 
-    for (size_t p = 0; p < num_partitions; ++p) {
-        auto& owner = sorted_peers[p % sorted_peers.size()];
-        std::string key = std::to_string(dist_id) + ":"
-                        + std::to_string(p);
-
-        if (owner.id == cfg_.node_id) {
-            // Local partition -- store directly.
-            ByteBuffer buf =
-                vega::serialize<std::vector<T>>(all_parts[p].data());
-            std::lock_guard<std::mutex> lock(local_data_mu_);
-            local_partitions_[key] = std::move(buf);
-        } else if (!all_parts[p].data().empty()) {
+    if (is_root) {
+        // Partition the data and send every partition -- empty ones too, so
+        // owners know it is complete -- directly to its owner (P2P).
+        size_t total = data.size();
+        for (size_t i = 0; i < num_partitions; ++i) {
+            size_t begin = total * i / num_partitions;
+            size_t end = total * (i + 1) / num_partitions;
+            all_parts[i] = Partition<T>(i, std::vector<T>(data.begin() + begin, data.begin() + end));
+        }
+        for (size_t p = 0; p < num_partitions; ++p) {
+            auto& owner = sorted_peers[p % sorted_peers.size()];
+            if (owner.id == cfg_.node_id) continue;
             ByteBuffer body;
-            Serializer<std::string>::serialize(key, body);
-            Serializer<std::vector<T>>::serialize(
-                all_parts[p].data(), body);
-            router_.send(owner.endpoint,
-                         net::NetMsgType::PARTITION_DATA,
-                         cfg_.node_id, body);
+            Serializer<std::string>::serialize(key_of(p), body);
+            Serializer<std::vector<T>>::serialize(all_parts[p].data(), body);
+            router_.send(owner.endpoint, net::NetMsgType::PARTITION_DATA, cfg_.node_id, body);
+        }
+    } else {
+        // Wait for the partitions this peer owns.
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (size_t p = 0; p < num_partitions; ++p) {
+            if (sorted_peers[p % sorted_peers.size()].id != cfg_.node_id) continue;
+            ByteBuffer buf;
+            {
+                std::unique_lock<std::mutex> lock(local_data_mu_);
+                const std::string key = key_of(p);
+                if (!local_data_cv_.wait_until(lock, deadline, [&] { return local_partitions_.count(key) > 0; }))
+                    throw std::runtime_error("Cluster::scatter: timed out waiting for partition " +
+                                             std::to_string(p) + " from the root peer");
+                buf = std::move(local_partitions_[key]);
+                local_partitions_.erase(key);
+            }
+            all_parts[p] = Partition<T>(p, vega::deserialize<std::vector<T>>(buf));
         }
     }
 
-    // Build the local RDD with correct global partition layout.
-    auto impl = std::make_shared<ParallelCollectionRDDImpl<T>>(
-        std::move(all_parts));
+    // Build the local RDD with the global partition layout; this peer holds
+    // the data of the partitions it owns (the root holds all of them).
+    auto impl = std::make_shared<ParallelCollectionRDDImpl<T>>(std::move(all_parts));
     impl->set_distribution_id(dist_id);
     return RDD<T>(std::move(impl));
 }
@@ -502,13 +524,12 @@ std::vector<T> Cluster::execute_narrow(
     auto my_pids = my_partitions(total_parts);
     size_t np = num_peers();
 
-    // Set up gather state for results from other peers.
-    auto gs = std::make_shared<GatherState>();
-    gs->expected = total_parts;
-    gs->received = 0;
+    // Gather state for results from other peers (may already hold blocks
+    // from faster peers).
+    auto gs = gather_for(job_id);
     {
-        std::lock_guard<std::mutex> lock(gather_mu_);
-        gathers_[job_id] = gs;
+        std::lock_guard<std::mutex> lock(gs->mu);
+        gs->expected = total_parts;
     }
 
     // Compute my local partitions and broadcast results.
@@ -570,18 +591,12 @@ std::vector<T> Cluster::execute_with_shuffle(
     size_t reduce_parts = rdd.num_partitions();
     size_t np = num_peers();
 
-    // Register the shuffle RDD so incoming blocks can be routed to it.
-    {
-        std::lock_guard<std::mutex> lock(active_shuffle_mu_);
-        active_shuffle_rdds_[job_id] = shuffle_rdd;
-    }
+    // Register the shuffle RDD so incoming blocks can be routed to it
+    // (blocks that arrived early are replayed).
+    register_shuffle(job_id, shuffle_rdd);
 
-    // Create the MAP_DONE barrier.
-    auto barrier = std::make_shared<ShuffleBarrier>();
-    {
-        std::lock_guard<std::mutex> lock(barriers_mu_);
-        barriers_[job_id] = barrier;
-    }
+    // The MAP_DONE barrier (faster peers may already have signalled).
+    barrier_for(job_id);
 
     // --- MAP PHASE: compute local map partitions, send shuffle blocks P2P ---
 
@@ -623,13 +638,11 @@ std::vector<T> Cluster::execute_with_shuffle(
 
     auto my_reduce_pids = my_partitions(reduce_parts);
 
-    // Set up gather state.
-    auto gs = std::make_shared<GatherState>();
-    gs->expected = reduce_parts;
-    gs->received = 0;
+    // Gather state (may already hold blocks from faster peers).
+    auto gs = gather_for(job_id);
     {
-        std::lock_guard<std::mutex> lock(gather_mu_);
-        gathers_[job_id] = gs;
+        std::lock_guard<std::mutex> lock(gs->mu);
+        gs->expected = reduce_parts;
     }
 
     for (auto pid : my_reduce_pids) {
