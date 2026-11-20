@@ -123,6 +123,10 @@ public:
 
     RDD<T> filter(std::function<bool(const T&)> pred) const;
 
+    // Concatenate the partitions of two RDDs (Spark's union): partitions of
+    // `this` come first, then those of `other`.
+    RDD<T> union_with(const RDD<T>& other) const;
+
     template<typename Func>
     auto flatMap(Func&& func) const
         -> RDD<typename std::invoke_result_t<Func, const T&>::value_type>;
@@ -327,6 +331,36 @@ private:
     std::function<std::vector<U>(const T&)> func_;
 };
 
+// union: partitions of `a` followed by partitions of `b` (narrow; two parents).
+template<typename T>
+class UnionRDDImpl : public RDDBase {
+public:
+    UnionRDDImpl(std::shared_ptr<RDDBase> a, std::shared_ptr<RDDBase> b)
+        : a_(std::move(a)), b_(std::move(b)) {}
+
+    size_t num_partitions() const override {
+        return a_->num_partitions() + b_->num_partitions();
+    }
+
+    std::any compute_partition(size_t pid) const override {
+        const size_t na = a_->num_partitions();
+        return pid < na ? a_->compute_partition(pid) : b_->compute_partition(pid - na);
+    }
+
+    size_t compute_partition_count(size_t pid) const override {
+        const size_t na = a_->num_partitions();
+        return pid < na ? a_->compute_partition_count(pid)
+                        : b_->compute_partition_count(pid - na);
+    }
+
+    std::vector<std::shared_ptr<RDDBase>> dependencies() const override {
+        return {a_, b_};
+    }
+
+private:
+    std::shared_ptr<RDDBase> a_, b_;
+};
+
 // ===========================================================================
 // RDD<T> transformation implementations (lazy – no SparkContext needed)
 // ===========================================================================
@@ -349,6 +383,13 @@ RDD<T> RDD<T>::filter(std::function<bool(const T&)> pred) const {
         impl_, std::move(pred));
     filtered->set_context(impl_->context());
     return RDD<T>(std::move(filtered));
+}
+
+template<typename T>
+RDD<T> RDD<T>::union_with(const RDD<T>& other) const {
+    auto u = std::make_shared<UnionRDDImpl<T>>(impl_, other.impl_);
+    u->set_context(impl_->context());
+    return RDD<T>(std::move(u));
 }
 
 template<typename T>

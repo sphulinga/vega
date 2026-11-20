@@ -12,7 +12,8 @@ lazily until an action runs.
 | [Server, workers, and clients](server-and-workers.md) | `vega_server`, actor workers, cluster peers, connection modes |
 | [Python RDD guide](python-guide.md) | PyVega API, transformations, actions, I/O |
 | [PySpark compatibility](pyspark-compat.md) | Run PySpark-style code and upstream RDD tests |
-| [DataFrame-style operations](dataframe-operations.md) | RDD equivalents for common SQL/DataFrame patterns |
+| [C++ DataFrames](cpp-dataframes.md) | Native columnar DataFrames in C++: expressions, group-by, joins, sorting |
+| [DataFrame-style operations](dataframe-operations.md) | RDD equivalents for common SQL/DataFrame patterns in Python |
 | [Vega extras](vega-extras.md) | Operations beyond Spark's RDD API |
 | [Releasing](releasing.md) | Wheels, PyPI trusted publishing, release checklist |
 
