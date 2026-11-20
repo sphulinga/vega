@@ -404,7 +404,8 @@ SQL semantics:
   - predicate pushdown
   - column pruning
   - outer-join elimination
-  - eager aggregation through joins
+  - eager aggregation through joins, guided by distinct-value statistics
+    (HyperLogLog sketches built when a DataFrame is created or cached)
   - top-N and window group limits
   - broadcast or shuffle join selection
 - **`explain()`** shows the plans.

@@ -86,6 +86,10 @@ public:
         src->schema = schema;
         src->partitions = partitions;
         src->rows = rows;
+        // Column statistics: one HyperLogLog sketch per column and batch,
+        // built in parallel on the engine and merged here.
+        const auto sketches = src->rdd.map([](const Batch& b) { return sketch_batch(b); }).collect();
+        src->stats = merge_sketches(sketches, schema.size());
         return DataFrame(&ctx, plan::scan(src));
     }
 
@@ -105,6 +109,13 @@ public:
         return out;
     }
     const PlanPtr& plan() const { return plan_; }
+
+    // Optimizer estimates for this DataFrame: rows, and distinct values of
+    // a column (nullopt when unknown, e.g. for computed columns).
+    double estimated_rows() const { return plan::estimate_rows(plan_); }
+    std::optional<double> estimated_distinct(const std::string& column) const {
+        return plan::estimate_ndv(plan_, column);
+    }
 
     // ----- transformations (lazy) ----------------------------------------------
 

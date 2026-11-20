@@ -21,6 +21,7 @@
 
 #include "vega/core/context.hpp"
 #include "vega/dataframe/aggregate.hpp"
+#include "vega/dataframe/stats.hpp"
 
 namespace vega::df {
 
@@ -46,6 +47,7 @@ struct Source {
     Schema schema;
     size_t partitions = 1;
     size_t rows = 0;  // exact row count
+    std::vector<ColumnStats> stats;  // per schema column (may be empty: unknown)
     std::string label = "LocalRelation";
 };
 
@@ -286,13 +288,106 @@ inline PlanPtr with_inputs(const PlanPtr& n, std::vector<PlanPtr> inputs) {
 
 // ----- estimates (used for join strategy and optimizer heuristics) ----------
 
+double estimate_rows(const PlanPtr& n);
+
+// Estimated number of distinct values (null counted as one value) of an
+// output column, or nullopt when unknown (e.g. computed expressions).
+inline std::optional<double> estimate_ndv(const PlanPtr& n, const std::string& column) {
+    using K = PlanNode::Kind;
+    auto capped = [&](std::optional<double> v) -> std::optional<double> {
+        if (!v) return v;
+        return std::min(*v, std::max(1.0, estimate_rows(n)));
+    };
+    switch (n->kind) {
+    case K::Scan: {
+        const int i = schema_index(n->source->schema, column);
+        if (i < 0 || static_cast<size_t>(i) >= n->source->stats.size()) return std::nullopt;
+        const ColumnStats& st = n->source->stats[static_cast<size_t>(i)];
+        if (st.ndv < 0) return std::nullopt;
+        return capped(st.ndv + (st.nulls ? 1 : 0));
+    }
+    case K::Empty: return 0.0;
+    case K::Project: {
+        for (const auto& e : n->exprs) {
+            if (e.name() != column) continue;
+            const Expr s = e.strip_alias();
+            if (s.is_column()) return capped(estimate_ndv(n->input(), s.column_name()));
+            if (s.is_literal()) return 1.0;
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+    case K::Join: {
+        const bool left = schema_index(n->input(0)->schema, column) >= 0;
+        return capped(estimate_ndv(n->input(left ? 0 : 1), column));
+    }
+    case K::Aggregate: {
+        for (const auto& k : n->keys)
+            if (k.name() == column) {
+                const Expr s = k.strip_alias();
+                return s.is_column() ? capped(estimate_ndv(n->input(), s.column_name())) : std::nullopt;
+            }
+        return std::nullopt;
+    }
+    case K::Window:
+        if (schema_index(n->input()->schema, column) < 0) return std::nullopt;
+        return capped(estimate_ndv(n->input(), column));
+    case K::Union: {
+        double total = 0;
+        for (size_t i = 0; i < n->inputs.size(); ++i) {
+            const int pos = schema_index(n->schema, column);
+            auto v = estimate_ndv(n->inputs[i], n->inputs[i]->schema[static_cast<size_t>(pos)].name);
+            if (!v) return std::nullopt;
+            total += *v;
+        }
+        return capped(total);
+    }
+    default: return capped(estimate_ndv(n->input(), column));
+    }
+}
+
+// Estimated number of groups of `keys` over `n` (product of the key NDVs,
+// capped by the row count), or nullopt when a key's NDV is unknown.
+inline std::optional<double> estimate_groups(const PlanPtr& n, const std::vector<Expr>& keys) {
+    double groups = 1;
+    for (const auto& k : keys) {
+        const Expr s = k.strip_alias();
+        if (s.is_literal()) continue;
+        if (!s.is_column()) return std::nullopt;
+        const auto v = estimate_ndv(n, s.column_name());
+        if (!v) return std::nullopt;
+        groups *= std::max(1.0, *v);
+    }
+    return std::min(groups, std::max(1.0, estimate_rows(n)));
+}
+
+// Selectivity of a predicate: column = literal -> 1 / NDV, IS NULL -> null
+// fraction (when known), AND multiplies, otherwise a fixed 0.5.
+inline double estimate_selectivity(const Expr& e, const PlanPtr& input) {
+    const Expr p = e.strip_alias();
+    if (p.kind() == Expr::Kind::Binary && p.op() == Expr::Op::And)
+        return estimate_selectivity(p.children()[0], input) * estimate_selectivity(p.children()[1], input);
+    if (p.kind() == Expr::Kind::Binary && p.op() == Expr::Op::Eq) {
+        const Expr& a = p.children()[0];
+        const Expr& b = p.children()[1];
+        const Expr* c = a.is_column() && b.is_literal() ? &a : (b.is_column() && a.is_literal() ? &b : nullptr);
+        if (c)
+            if (auto v = estimate_ndv(input, c->column_name())) return 1.0 / std::max(1.0, *v);
+    }
+    return 0.5;
+}
+
 inline double estimate_rows(const PlanPtr& n) {
     using K = PlanNode::Kind;
     switch (n->kind) {
     case K::Scan: return static_cast<double>(n->source->rows);
     case K::Empty: return 0;
-    case K::Filter: return estimate_rows(n->input()) * 0.5;
-    case K::Aggregate: return n->keys.empty() ? 1 : estimate_rows(n->input()) * 0.5;
+    case K::Filter: return estimate_rows(n->input()) * estimate_selectivity(n->exprs[0], n->input());
+    case K::Aggregate: {
+        if (n->keys.empty()) return 1;
+        if (auto g = estimate_groups(n->input(), n->keys)) return *g;
+        return estimate_rows(n->input()) * 0.5;
+    }
     case K::Limit: return std::min(static_cast<double>(n->limit), estimate_rows(n->input()));
     case K::Join: {
         const double l = estimate_rows(n->input(0)), r = estimate_rows(n->input(1));
