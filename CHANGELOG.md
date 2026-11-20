@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
+## [2.0.0] - 2026-11-20
+
+A major release for the new native C++ DataFrame API. No existing C++ RDD or
+PyVega API changed, so code written for 1.x keeps working.
+
+### Added
+- **C++ DataFrames** (`#include <vega/dataframe.hpp>`, namespace `vega::df`):
+  columnar, typed DataFrames that run on the actor engine, with Spark SQL
+  semantics. See `docs/cpp-dataframes.md`.
+  - Types `bigint`, `double`, `string` and `boolean`. Every column can hold
+    nulls, stored as an optional validity mask.
+  - Low-cardinality strings are dictionary-encoded automatically.
+  - Expressions:
+    - arithmetic and comparisons
+    - three-valued `AND`/`OR`/`NOT`, `<=>`, `isin`, `between`
+    - `when`/`otherwise`, `coalesce`, `isnull`/`isnotnull`
+    - ANSI `cast`
+    - string functions: `upper`, `lower`, `trim`, `length`, `substring`,
+      `concat`, `contains`, `startswith`, `endswith`, `like`
+    - math functions: `abs`, `round`, `floor`, `ceil`, `sqrt`
+  - Operations:
+    - `select`, `with_column`, `filter`
+    - `group_by().agg()` with `sum`, `count`, `avg`, `min`, `max`, `variance`,
+      `stddev` and `count_distinct`
+    - inner, left, right, full, semi, anti and cross joins
+    - `union_all`, `union_by_name`, `distinct`, `drop_duplicates`
+    - `order_by`, `limit`, `fill_null`, `drop_nulls`, `repartition`, `cache`
+    - `count`, `collect`, `show`, `explain`
+    - CSV read and write
+  - Window functions: `row_number`, `rank`, `dense_rank`, `lag`, `lead`, and
+    windowed `sum`/`avg`/`min`/`max`/`count`.
+- **Query optimizer** for DataFrames:
+  - constant folding and boolean simplification
+  - predicate pushdown through projections, sorts, unions, windows,
+    aggregates and joins
+  - outer-join elimination, and join-key predicates copied to the other side
+  - column pruning down to the scans
+  - project collapsing, sort elimination, limit pushdown
+  - eager aggregation through inner joins
+  - window group limits, and top-N for `order_by().limit()`
+- **Physical planning:**
+  - broadcast or shuffle hash joins, chosen from size estimates
+  - fused per-batch stages
+  - two-phase hash aggregation, with dedicated hash tables for one or two
+    integer keys and for dictionary-encoded keys
+- **Column statistics.** Creating or caching a DataFrame records exact row
+  and null counts, plus distinct-value counts: exact for dictionary-encoded
+  columns, HyperLogLog estimates otherwise. They guide group-size and filter
+  estimates, the join strategy, and eager aggregation.
+  `df.estimated_rows()` and `df.estimated_distinct(col)` expose them.
+- `RDD::union_with` in the C++ core.
+- Benchmarks:
+  - `benchmarks/bench_dataframe.py` runs 12 DataFrame queries on Vega C++,
+    Spark SQL and Sail, and checks that all three return the same answers.
+  - `benchmarks/bench_native_ops.py` compares Vega's C++ RDD API with Spark's
+    Scala RDD API.
+  - `benchmarks/bench_python_ops.py` compares PyVega with PySpark.
+  - Results are in the README.
+
+### Changed
+- README performance section: v0.5.0, v1.0.0 and v1.1.0 re-measured on one
+  machine, plus like-for-like comparisons with Apache Spark.
+
 ## [1.1.0] - 2026-11-17
 
 ### Fixed

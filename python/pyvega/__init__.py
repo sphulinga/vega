@@ -12,7 +12,7 @@ system run in the C++ server process; this package is a thin RPC client.
 
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 from pyvega.accumulators import Accumulator, AccumulatorParam
 from pyvega.broadcast import Broadcast
