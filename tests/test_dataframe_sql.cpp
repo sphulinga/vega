@@ -560,3 +560,68 @@ TEST_F(DataFrameSqlTest, WindowGroupLimitMatchesReference) {
         for (auto r : ints(b, "r")) EXPECT_LE(*r, 3);
     }
 }
+
+TEST_F(DataFrameSqlTest, DistinctValueEstimates) {
+    std::vector<int64_t> id, k, small;
+    std::vector<std::string> s;
+    std::vector<OptI> sparse;
+    for (int i = 0; i < 200000; ++i) {
+        id.push_back(i);
+        k.push_back(i % 50000);
+        small.push_back(i % 7);
+        s.push_back("v" + std::to_string(i % 300));
+        sparse.push_back(i % 4 == 0 ? OptI(i % 10) : std::nullopt);
+    }
+    auto df = DataFrame::from_columns(ctx,
+                                      {{"id", Column(id)}, {"k", Column(k)}, {"small", Column(small)},
+                                       {"s", Column(s)}, {"sparse", Column(sparse)}},
+                                      6);
+    auto near = [](std::optional<double> v, double want, double tol) {
+        return v && std::abs(*v - want) <= want * tol;
+    };
+    EXPECT_TRUE(near(df.estimated_distinct("id"), 200000, 0.05)) << *df.estimated_distinct("id");
+    EXPECT_TRUE(near(df.estimated_distinct("k"), 50000, 0.05)) << *df.estimated_distinct("k");
+    EXPECT_EQ(df.estimated_distinct("small"), 7.0);
+    EXPECT_EQ(df.estimated_distinct("s"), 300.0);        // dictionary-encoded: exact
+    EXPECT_EQ(df.estimated_distinct("sparse"), 6.0);     // 0, 2, 4, 6, 8 + null
+    // propagation through plans
+    EXPECT_EQ(df.select({col("s").alias("t")}).estimated_distinct("t"), 300.0);
+    EXPECT_FALSE(df.select({(col("k") + 1).alias("k1")}).estimated_distinct("k1").has_value());
+    EXPECT_EQ(df.group_by({col("small")}).count().estimated_rows(), 7.0);
+    EXPECT_TRUE(near(df.group_by({col("small"), col("s")}).count().estimated_rows(), 2100, 0.01));
+    EXPECT_NEAR(df.filter(col("s") == "v1").estimated_rows(), 200000.0 / 300, 1);
+    EXPECT_EQ(df.limit(5).estimated_distinct("k"), 5.0);
+    // cache() re-derives statistics from the cached data
+    auto c = df.filter(col("small") == 3).cache();
+    EXPECT_EQ(c.estimated_distinct("small"), 1.0);
+    EXPECT_EQ(c.estimated_rows(), static_cast<double>(c.count()));
+}
+
+TEST_F(DataFrameSqlTest, EagerAggregationNeedsAReduction) {
+    // Line items x orders: ~2 items per order, so pre-aggregating items by
+    // order_id would not shrink them -- the rule must not fire.
+    std::vector<int64_t> item_order, qty, order_id, customer;
+    for (int i = 0; i < 20000; ++i) {
+        item_order.push_back(i / 2);
+        qty.push_back(i % 5);
+    }
+    for (int o = 0; o < 10000; ++o) {
+        order_id.push_back(o);
+        customer.push_back(o % 300);
+    }
+    auto items = DataFrame::from_columns(ctx, {{"order_id", Column(item_order)}, {"qty", Column(qty)}}, 4);
+    auto orders = DataFrame::from_columns(ctx, {{"order_id", Column(order_id)}, {"customer", Column(customer)}}, 2);
+    auto q = items.join(orders, {"order_id"}).group_by({col("customer")}).agg({sum(col("qty")).alias("q")});
+    const std::string p = plan::to_string(q.optimized());
+    EXPECT_EQ(p.find("Aggregate keys=[order_id]"), std::string::npos) << p;
+    int64_t total = 0;
+    for (auto v : ints(q.collect(), "q")) total += *v;
+    EXPECT_EQ(total, 2 * 20000);
+    EXPECT_EQ(q.count(), 300u);
+    // ...while a fact table with few distinct keys is pre-aggregated
+    std::vector<int64_t> few;
+    for (int i = 0; i < 20000; ++i) few.push_back(i % 100);
+    auto facts = DataFrame::from_columns(ctx, {{"order_id", Column(few)}, {"qty", Column(qty)}}, 4);
+    auto q2 = facts.join(orders, {"order_id"}).group_by({col("customer")}).agg({sum(col("qty")).alias("q")});
+    EXPECT_NE(plan::to_string(q2.optimized()).find("Aggregate keys=[order_id]"), std::string::npos);
+}

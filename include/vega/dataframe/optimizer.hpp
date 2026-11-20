@@ -22,7 +22,9 @@
 //   PushAggregateThroughJoin  (eager aggregation) group-by over an inner join
 //                          whose aggregates read one side only: that side is
 //                          pre-aggregated by its join keys before the join,
-//                          then partial results are combined above it
+//                          then partial results are combined above it. Applied
+//                          only when the keys' distinct-value estimates show
+//                          the pre-aggregation shrinks that side >= 4x
 //   ColumnPruning          every node produces only the columns used above it,
 //                          down to the scans
 
@@ -518,7 +520,13 @@ inline std::optional<PlanPtr> try_push_aggregate(const PlanPtr& agg) {
         const std::string c = resolve(k.strip_alias().column_name());
         if (s_cols.count(c) && !s_key_set.count(c)) return std::nullopt;
     }
-    if (plan::estimate_rows(O) * 4 > plan::estimate_rows(S)) return std::nullopt;
+    // Only worth it when pre-aggregating S by its join keys shrinks it a lot:
+    // S must have at least 4x more rows than (estimated) distinct join keys.
+    // Without statistics for the keys, do not risk it.
+    std::vector<Expr> key_exprs;
+    for (const auto& k : s_keys) key_exprs.push_back(col(k));
+    const auto groups = plan::estimate_groups(S, key_exprs);
+    if (!groups || *groups * 4 > plan::estimate_rows(S)) return std::nullopt;
 
     // Partial aggregates on S.
     std::vector<AggExpr> partial, final_aggs;

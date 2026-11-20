@@ -153,7 +153,28 @@ strategy. The optimizer applies these rules:
 | Project collapsing | Adjacent projections merge (unless that would repeat an expensive expression), and identity projections disappear |
 | Sort elimination | A sort that feeds an aggregate, join, window or another sort is dropped |
 | Limit pushdown | Limits move through projections and into union inputs. `order_by(...).limit(n)` runs as a parallel top-N |
-| Eager aggregation | A group-by over an inner join whose aggregates read one side is pre-aggregated by its join keys before the join (for example, sales grouped by store before joining stores), then combined. It applies to `sum`, `count`, `min`, `max` and `avg` when the other side is at least 4× smaller |
+| Eager aggregation | A group-by over an inner join whose aggregates read one side is pre-aggregated by that side's join keys before the join (for example, sales grouped by store before joining stores), then combined. It applies to `sum`, `count`, `min`, `max` and `avg`. It fires only when the statistics show the pre-aggregation shrinks that side at least 4×: the join keys' estimated distinct-value count must be at most a quarter of the side's estimated row count. So a fact table with few distinct keys is pre-aggregated, while line items joined to orders (about 2 items per order) are not |
+
+**Statistics.** Creating or caching a DataFrame (`from_columns`,
+`from_batch`, `read_csv`, `cache()`) also records statistics for every
+column:
+
+- **Row counts** are exact.
+- **Null counts** are exact.
+- **Distinct-value counts** are exact for dictionary-encoded columns and
+  estimated with a HyperLogLog sketch for the others (2^12 registers, 4 KB
+  per column, about 1.6% error).
+- **Cost.** Partitions are sketched in parallel on the engine and merged. For
+  a 10M-row, 6-column table this adds about 150 ms on 4 cores.
+
+The estimates flow through the plan: projections pass them through, and
+joins, filters and limits cap them. They drive three decisions:
+
+- **Group-by sizes:** the product of the key NDVs, capped by the input rows.
+- **Filter selectivity:** `col = literal` is `1 / NDV(col)`; other predicates use a fixed 0.5.
+- **Optimizer choices:** whether eager aggregation fires, and whether a join is broadcast or shuffled.
+
+`df.estimated_rows()` and `df.estimated_distinct("col")` expose the estimates.
 
 **Physical planning:**
 
@@ -177,7 +198,7 @@ strategy. The optimizer applies these rules:
 - No date or decimal types.
 - Window frames are the two Spark defaults only: a running frame with `ORDER BY`, the whole partition without.
 - String functions are byte-oriented, except `length` and `substring`, which count UTF-8 code points.
-- Statistics are rough: exact source row counts, and a fixed selectivity for filters.
+- Statistics cover sources and cached data only. Computed columns have no NDV estimate. Predicates other than `col = literal` get a fixed selectivity, and there are no histograms.
 - No Python bindings yet.
 
 ## Performance

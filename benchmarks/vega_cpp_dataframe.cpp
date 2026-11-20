@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
         price[k] = static_cast<double>((i * 13) % 1000) / 10.0 + 1.0;
         category[k] = "cat" + std::to_string(i % 8);
     }
+    const auto setup0 = std::chrono::steady_clock::now();
     auto sales = DataFrame::from_columns(ctx,
                                          {{"id", Column(std::move(id))},
                                           {"store", Column(std::move(store))},
@@ -77,6 +78,8 @@ int main(int argc, char** argv) {
                                           {"price", Column(std::move(price))},
                                           {"category", Column(std::move(category))}},
                                          parts);
+    std::fprintf(stderr, "setup: from_columns (encode + statistics) %.1f ms\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup0).count());
     std::vector<int64_t> sid(1000);
     std::vector<std::string> region(1000);
     for (int64_t s = 0; s < 1000; ++s) {
