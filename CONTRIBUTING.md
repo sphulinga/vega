@@ -59,6 +59,11 @@ VEGA_SERVER=build-release/vega_server \
 
 Benchmarks: `python benchmarks/bench_pyvega_ops.py --json out.json` times common
 operations; run it before and after a performance change.
+Engine comparisons are like for like: `benchmarks/bench_python_ops.py
+--engine pyvega|pyspark` runs the same Python code on both, and
+`benchmarks/bench_native_ops.py --engine vega-cpp|spark-scala` compares Vega's
+C++ API with Spark's Scala API (build the `vega_cpp_ops` target; Spark needs
+Java 17+ and `pip install pyspark`, which bundles it).
 
 Releases: see [docs/releasing.md](docs/releasing.md).
 
