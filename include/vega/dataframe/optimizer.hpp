@@ -306,7 +306,7 @@ inline PlanPtr push_filter_node(const PlanPtr& f) {
             else up.push_back(e);
         }
         const PlanPtr in = push_filters(down.empty() ? c->input() : plan::filter(c->input(), conjoin(down)));
-        PlanPtr out = plan::window(in, c->exprs);
+        PlanPtr out = plan::window(in, c->exprs, c->group_limit);
         return up.empty() ? out : plan::filter(out, conjoin(up));
     }
     default: return plan::filter(push_filters(c), p);
@@ -675,7 +675,7 @@ inline PlanPtr prune(const PlanPtr& n, const std::set<std::string>& req) {
                 plan::add_refs(e, r);
             }
         if (kept.empty()) return prune(n->input(), r);
-        return plan::window(prune(n->input(), r), kept);
+        return plan::window(prune(n->input(), r), kept, n->group_limit);
     }
     case K::Union: {
         std::vector<size_t> pos;
@@ -701,6 +701,43 @@ inline PlanPtr prune(const PlanPtr& n, const std::set<std::string>& req) {
     return n;
 }
 
+// ----- WindowGroupLimit ------------------------------------------------------------
+// filter(rn <= k) over a window computing only row_number/rank (with an
+// ORDER BY): each input partition can drop all but its top k rows per window
+// partition before the shuffle (Spark 3.5's WindowGroupLimit).
+
+inline PlanPtr window_group_limit(const PlanPtr& n) {
+    std::vector<PlanPtr> in;
+    for (const auto& c : n->inputs) in.push_back(window_group_limit(c));
+    PlanPtr m = in.empty() ? n : plan::with_inputs(n, in);
+    if (m->kind != K::Filter || m->input()->kind != K::Window) return m;
+    const PlanPtr& w = m->input();
+    if (w->exprs.at(0).strip_alias().window_spec()->order.empty()) return m;
+    std::set<std::string> ranks;
+    for (const auto& e : w->exprs) {
+        const std::string& f = e.strip_alias().func_name();
+        if (f != "row_number" && f != "rank") return m;
+        ranks.insert(e.name());
+    }
+    size_t limit = 0;
+    for (const auto& c : conjuncts(m->exprs[0])) {
+        if (c.kind() != Expr::Kind::Binary || c.children().size() != 2) continue;
+        const Expr& a = c.children()[0];
+        const Expr& b = c.children()[1];
+        if (!a.is_column() || !ranks.count(a.column_name()) || !b.is_literal() || b.is_null_literal() ||
+            b.literal_value().index() != 0)
+            continue;
+        const int64_t k = std::get<int64_t>(b.literal_value());
+        int64_t lim = -1;
+        if (c.op() == Expr::Op::Le) lim = k;
+        else if (c.op() == Expr::Op::Lt) lim = k - 1;
+        else if (c.op() == Expr::Op::Eq) lim = k;
+        if (lim > 0 && (limit == 0 || static_cast<size_t>(lim) < limit)) limit = static_cast<size_t>(lim);
+    }
+    if (limit == 0 || (w->group_limit && w->group_limit <= limit)) return m;
+    return plan::filter(plan::window(w->input(), w->exprs, limit), m->exprs[0]);
+}
+
 // ----- driver ----------------------------------------------------------------------
 
 inline PlanPtr optimize(const PlanPtr& root) {
@@ -714,6 +751,7 @@ inline PlanPtr optimize(const PlanPtr& root) {
     p = simplify(p);
     p = prune(p, plan::names_of(root->schema));
     p = simplify(p);
+    p = window_group_limit(p);
     bool same = p->schema.size() == root->schema.size();
     for (size_t i = 0; same && i < p->schema.size(); ++i) same = p->schema[i].name == root->schema[i].name;
     if (!same) {

@@ -10,6 +10,7 @@
 
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
 
 val n = sys.env.getOrElse("BENCH_N", "10000000").toLong
 val repeat = sys.env.getOrElse("BENCH_REPEAT", "5").toInt
@@ -61,7 +62,15 @@ val queries: Seq[(String, () => String)] = Seq(
   "orderBy price desc limit 10" -> (() => {
     val rows = sales.orderBy(col("price").desc, col("id").asc).limit(10).collect()
     s"${rows.length}|${rows.map(_.getLong(0)).sum}|${fmt(rows(0).getDouble(4))}"
-  })
+  }),
+  "left join + filter region" -> (() => row(
+    sales.join(stores, Seq("store"), "left").filter(col("region") === "r1").agg(count(lit(1)), sum("qty")))),
+  "window top-3 per store" -> (() => {
+    val w = Window.partitionBy("store").orderBy(col("price").desc, col("id").asc)
+    row(sales.withColumn("rn", row_number().over(w)).filter(col("rn") <= 3).agg(count(lit(1)), sum("id")))
+  }),
+  "countDistinct product by category" -> (() => row(
+    sales.groupBy("category").agg(countDistinct("product").as("d")).agg(count(lit(1)), sum("d"))))
 )
 
 for (_ <- 0 until warmup; (_, q) <- queries) q()

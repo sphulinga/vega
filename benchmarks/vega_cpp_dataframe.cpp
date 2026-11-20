@@ -139,6 +139,28 @@ int main(int argc, char** argv) {
              for (size_t r = 0; r < b.num_rows(); ++r) ids += at<int64_t>(b, 0, r);
              return num(static_cast<int64_t>(b.num_rows())) + "|" + num(ids) + "|" + num(at<double>(b, 4));
          }},
+        {"left join + filter region", [&] {
+             Batch b = sales.join(stores, {"store"}, JoinType::Left)
+                           .filter(col("region") == "r1")
+                           .agg({count_all(), sum(col("qty"))})
+                           .collect();
+             return num(at<int64_t>(b, 0)) + "|" + num(at<int64_t>(b, 1));
+         }},
+        {"window top-3 per store", [&] {
+             const auto w = Window::partition_by({col("store")}).order_by({desc(col("price")), asc(col("id"))});
+             Batch b = sales.with_column("rn", row_number().over(w))
+                           .filter(col("rn") <= 3)
+                           .agg({count_all(), sum(col("id"))})
+                           .collect();
+             return num(at<int64_t>(b, 0)) + "|" + num(at<int64_t>(b, 1));
+         }},
+        {"countDistinct product by category", [&] {
+             Batch b = sales.group_by({col("category")})
+                           .agg({count_distinct(col("product")).alias("d")})
+                           .agg({count_all(), sum(col("d"))})
+                           .collect();
+             return num(at<int64_t>(b, 0)) + "|" + num(at<int64_t>(b, 1));
+         }},
     };
 
     for (size_t w = 0; w < warmup; ++w)

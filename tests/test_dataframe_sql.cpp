@@ -525,3 +525,38 @@ TEST_F(DataFrameSqlTest, DictionaryEncodedStrings) {
     Batch s = df.select({concat({col("cat"), lit("x")}).alias("y")}).distinct().collect();
     EXPECT_EQ(s.num_rows(), 9u);
 }
+
+TEST_F(DataFrameSqlTest, WindowGroupLimitMatchesReference) {
+    std::mt19937 rng(3);
+    std::vector<int64_t> g, s, id;
+    for (int i = 0; i < 3000; ++i) {
+        g.push_back(rng() % 17);
+        s.push_back(rng() % 9);  // many ties
+        id.push_back(i);
+    }
+    auto df = DataFrame::from_columns(ctx, {{"g", Column(g)}, {"s", Column(s)}, {"id", Column(id)}}, 4);
+    const auto w = Window::partition_by({col("g")}).order_by({desc(col("s"))});
+    for (const bool use_rank : {false, true}) {
+        const WindowFunction f = use_rank ? rank() : row_number();
+        auto q = df.with_column("r", f.over(w)).filter(col("r") <= 3);
+        EXPECT_NE(plan::to_string(q.optimized()).find("limit 3 per partition"), std::string::npos);
+        const Batch b = q.collect();
+        // reference: per group, count rows whose rank is <= 3
+        std::map<int64_t, std::vector<int64_t>> by_g;
+        for (size_t i = 0; i < g.size(); ++i) by_g[g[i]].push_back(s[i]);
+        size_t want = 0;
+        for (auto& [k, v] : by_g) {
+            std::sort(v.rbegin(), v.rend());
+            if (!use_rank) {
+                want += std::min<size_t>(3, v.size());
+            } else {
+                for (size_t i = 0; i < v.size(); ++i) {
+                    const size_t rk = static_cast<size_t>(std::find(v.begin(), v.end(), v[i]) - v.begin()) + 1;
+                    want += rk <= 3;
+                }
+            }
+        }
+        EXPECT_EQ(b.num_rows(), want) << (use_rank ? "rank" : "row_number");
+        for (auto r : ints(b, "r")) EXPECT_LE(*r, 3);
+    }
+}

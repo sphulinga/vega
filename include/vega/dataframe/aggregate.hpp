@@ -179,6 +179,18 @@ inline Groups group_rows(const std::vector<Column>& keys, size_t rows) {
         }
         return g;
     }
+    auto plain_int = [](const Column& c) { return c.type() == DType::Int64 && !c.has_nulls() && !c.is_dict(); };
+    if (keys.size() == 2 && plain_int(keys[0]) && plain_int(keys[1])) {  // two integer keys
+        const auto& a = keys[0].values<int64_t>();
+        const auto& b = keys[1].values<int64_t>();
+        Int64PairGroupTable table(std::min<size_t>(rows, 4096));
+        for (size_t r = 0; r < rows; ++r) {
+            auto [id, inserted] = table.find_or_insert(a[r], b[r]);
+            if (inserted) g.first.push_back(static_cast<uint32_t>(r));
+            g.gid[r] = id;
+        }
+        return g;
+    }
     GroupTable table(std::min<size_t>(rows, 4096));
     const KeyHasher hash(keys);
     const KeyEq eq(keys, keys);

@@ -357,6 +357,53 @@ private:
     size_t size_ = 0;
 };
 
+// Same for a pair of int64 keys (e.g. group by two integer columns).
+class Int64PairGroupTable {
+public:
+    explicit Int64PairGroupTable(size_t expected = 16) { reset(expected); }
+
+    std::pair<uint32_t, bool> find_or_insert(int64_t a, int64_t b) {
+        if ((size_ + 1) * 2 > slots_.size()) grow();
+        for (size_t i = hash(a, b) & mask_;; i = (i + 1) & mask_) {
+            Slot& s = slots_[i];
+            if (s.id == kEmpty) {
+                s = {a, b, static_cast<uint32_t>(size_++)};
+                return {s.id, true};
+            }
+            if (s.a == a && s.b == b) return {s.id, false};
+        }
+    }
+
+private:
+    static constexpr uint32_t kEmpty = 0xFFFFFFFFu;
+    struct Slot {
+        int64_t a, b;
+        uint32_t id;
+    };
+    static uint64_t hash(int64_t a, int64_t b) {
+        return finalize_hash(static_cast<uint64_t>(a) * 0x9E3779B97F4A7C15ULL ^ static_cast<uint64_t>(b));
+    }
+    void reset(size_t expected) {
+        size_t cap = 16;
+        while (cap < expected * 2) cap <<= 1;
+        slots_.assign(cap, Slot{0, 0, kEmpty});
+        mask_ = cap - 1;
+    }
+    void grow() {
+        std::vector<Slot> old = std::move(slots_);
+        reset(old.size());
+        for (const Slot& s : old) {
+            if (s.id == kEmpty) continue;
+            size_t i = hash(s.a, s.b) & mask_;
+            while (slots_[i].id != kEmpty) i = (i + 1) & mask_;
+            slots_[i] = s;
+        }
+    }
+    std::vector<Slot> slots_;
+    size_t mask_ = 0;
+    size_t size_ = 0;
+};
+
 // Open-addressing hash table from row hash to group id (ids are dense,
 // assigned in insertion order). The caller resolves hash collisions with an
 // equality callback against each candidate group's representative row.

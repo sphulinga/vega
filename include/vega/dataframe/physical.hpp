@@ -214,35 +214,78 @@ inline Batch unmatched_build(const Schema& out, const Schema& probe_schema, cons
 // Sorting
 // ---------------------------------------------------------------------------
 
-// Compare row ra of key columns a with row rb of key columns b.
+// Row comparator over sort-key columns with the type dispatch done up
+// front: compares row ra of `a` with row rb of `b` (negative / 0 / positive),
+// honouring direction and null placement.
+class RowCmp {
+public:
+    RowCmp(const std::vector<Column>& a, const std::vector<Column>& b, const std::vector<SortKey>& keys) {
+        for (size_t k = 0; k < keys.size(); ++k) {
+            hold_.push_back(a[k].flat());
+            hold_.push_back(b[k].flat());
+            const Column& ca = hold_[hold_.size() - 2];
+            const Column& cb = hold_.back();
+            if (ca.type() != cb.type()) throw std::logic_error("sort key types differ");
+            auto raw = [](const Column& c) { return c.visit_stored([](const auto& v) -> const void* { return v.data(); }); };
+            keys_.push_back({ca.type(), raw(ca), raw(cb), ca.validity(), cb.validity(), keys[k].ascending,
+                             keys[k].nulls_first});
+        }
+    }
+    int operator()(size_t ra, size_t rb) const {
+        for (const auto& k : keys_) {
+            const bool na = k.va && !k.va[ra], nb = k.vb && !k.vb[rb];
+            if (na || nb) {
+                if (na && nb) continue;
+                const int c = na ? -1 : 1;
+                return k.nulls_first ? c : -c;
+            }
+            int c = 0;
+            switch (k.type) {
+            case DType::Int64: c = cmp(static_cast<const int64_t*>(k.a)[ra], static_cast<const int64_t*>(k.b)[rb]); break;
+            case DType::Float64: c = cmp(static_cast<const double*>(k.a)[ra], static_cast<const double*>(k.b)[rb]); break;
+            case DType::String:
+                c = static_cast<const std::string*>(k.a)[ra].compare(static_cast<const std::string*>(k.b)[rb]);
+                c = c < 0 ? -1 : (c > 0 ? 1 : 0);
+                break;
+            case DType::Bool: c = cmp(static_cast<const uint8_t*>(k.a)[ra], static_cast<const uint8_t*>(k.b)[rb]); break;
+            }
+            if (c != 0) return k.ascending ? c : -c;
+        }
+        return 0;
+    }
+
+private:
+    template<typename T>
+    static int cmp(const T& x, const T& y) {
+        return x < y ? -1 : (y < x ? 1 : 0);
+    }
+    struct Key {
+        DType type;
+        const void* a;
+        const void* b;
+        const uint8_t* va;
+        const uint8_t* vb;
+        bool ascending, nulls_first;
+    };
+    std::vector<Column> hold_;
+    std::vector<Key> keys_;
+};
+
 inline int compare_rows(const std::vector<Column>& a, size_t ra, const std::vector<Column>& b, size_t rb,
                         const std::vector<SortKey>& keys) {
-    for (size_t k = 0; k < keys.size(); ++k) {
-        const bool na = !a[k].is_valid(ra), nb = !b[k].is_valid(rb);
-        if (na || nb) {
-            if (na && nb) continue;
-            const int c = na ? -1 : 1;
-            return keys[k].nulls_first ? c : -c;
-        }
-        const int c = a[k].visit([&](const auto& va) {
-            using T = typename std::decay_t<decltype(va)>::value_type;
-            const auto& vb = b[k].values<T>();
-            return va[ra] < vb[rb] ? -1 : (vb[rb] < va[ra] ? 1 : 0);
-        });
-        if (c != 0) return keys[k].ascending ? c : -c;
-    }
-    return 0;
+    return RowCmp(a, b, keys)(ra, rb);
 }
 
 // Row order of a batch under `keys`; keeps only the first `limit` rows.
 inline std::vector<uint32_t> sort_order(const Batch& b, const std::vector<SortKey>& keys,
                                         std::optional<size_t> limit) {
     std::vector<Column> kc;
-    for (const auto& k : keys) kc.push_back(k.expr.eval(b).flat());
+    for (const auto& k : keys) kc.push_back(k.expr.eval(b));
+    const RowCmp cmp(kc, kc, keys);
     std::vector<uint32_t> idx(b.num_rows());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<uint32_t>(i);
     auto less = [&](uint32_t x, uint32_t y) {
-        const int c = compare_rows(kc, x, kc, y, keys);
+        const int c = cmp(x, y);
         return c != 0 ? c < 0 : x < y;
     };
     if (limit && *limit < idx.size()) {
@@ -257,32 +300,69 @@ inline std::vector<uint32_t> sort_order(const Batch& b, const std::vector<SortKe
 // K-way merge of sorted runs.
 inline Batch merge_runs(const std::vector<Batch>& runs, const Schema& schema, const std::vector<SortKey>& keys,
                         std::optional<size_t> limit) {
-    std::vector<std::vector<Column>> run_keys(runs.size());
-    std::vector<size_t> offset(runs.size());
+    const Batch all = Batch::concat(runs, schema);
+    std::vector<Column> kc;
+    for (const auto& k : keys) kc.push_back(k.expr.eval(all));
+    const RowCmp cmp(kc, kc, keys);
+    std::vector<size_t> start, end;
     size_t total = 0;
-    for (size_t r = 0; r < runs.size(); ++r) {
-        for (const auto& k : keys) run_keys[r].push_back(k.expr.eval(runs[r]).flat());
-        offset[r] = total;
-        total += runs[r].num_rows();
+    for (const auto& r : runs) {
+        start.push_back(total);
+        total += r.num_rows();
+        end.push_back(total);
     }
     const size_t want = limit ? std::min(*limit, total) : total;
+    // heap of (row in `all`, run); ties broken by run index for determinism
     auto greater = [&](const std::pair<size_t, size_t>& x, const std::pair<size_t, size_t>& y) {
-        const int c = compare_rows(run_keys[x.first], x.second, run_keys[y.first], y.second, keys);
-        return c != 0 ? c > 0 : x.first > y.first;
+        const int c = cmp(x.first, y.first);
+        return c != 0 ? c > 0 : x.second > y.second;
     };
     std::priority_queue<std::pair<size_t, size_t>, std::vector<std::pair<size_t, size_t>>, decltype(greater)> heap(
         greater);
     for (size_t r = 0; r < runs.size(); ++r)
-        if (runs[r].num_rows() > 0) heap.emplace(r, 0);
+        if (start[r] < end[r]) heap.emplace(start[r], r);
     std::vector<uint32_t> order;
     order.reserve(want);
     while (!heap.empty() && order.size() < want) {
-        auto [r, i] = heap.top();
+        auto [row, r] = heap.top();
         heap.pop();
-        order.push_back(static_cast<uint32_t>(offset[r] + i));
-        if (i + 1 < runs[r].num_rows()) heap.emplace(r, i + 1);
+        order.push_back(static_cast<uint32_t>(row));
+        if (row + 1 < end[r]) heap.emplace(row + 1, r);
     }
-    return Batch::concat(runs, schema).take(order);
+    return all.take(order);
+}
+
+// Keep each window partition's top `k` rows by the window's ORDER BY (and,
+// with ties = true, rows tied with the k-th): the local step of
+// WindowGroupLimit.
+inline Batch local_group_top(const Batch& b, const WindowSpec& spec, size_t k, bool ties) {
+    if (b.num_rows() <= k) return b;
+    std::vector<Column> pk;
+    for (const auto& e : spec.partition) pk.push_back(e.eval(b));
+    const detail::Groups g = detail::group_rows(pk, b.num_rows());
+    std::vector<std::vector<uint32_t>> rows(g.count());
+    for (size_t r = 0; r < b.num_rows(); ++r) rows[g.gid[r]].push_back(static_cast<uint32_t>(r));
+    std::vector<Column> ok;
+    for (const auto& s : spec.order) ok.push_back(s.expr.eval(b));
+    const RowCmp cmp(ok, ok, spec.order);
+    auto less = [&](uint32_t x, uint32_t y) {
+        const int c = cmp(x, y);
+        return c != 0 ? c < 0 : x < y;
+    };
+    std::vector<uint32_t> keep;
+    for (auto& rs : rows) {
+        if (rs.size() <= k) {
+            keep.insert(keep.end(), rs.begin(), rs.end());
+            continue;
+        }
+        std::partial_sort(rs.begin(), rs.begin() + static_cast<std::ptrdiff_t>(k), rs.end(), less);
+        keep.insert(keep.end(), rs.begin(), rs.begin() + static_cast<std::ptrdiff_t>(k));
+        if (ties)
+            for (size_t i = k; i < rs.size(); ++i)
+                if (cmp(rs[i], rs[k - 1]) == 0) keep.push_back(rs[i]);
+    }
+    std::sort(keep.begin(), keep.end());
+    return b.take(keep);
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +398,8 @@ inline Batch compute_window(const Batch& in, const std::vector<Expr>& exprs, con
     for (const auto& k : spec.order) keys.push_back(k);
     const std::vector<uint32_t> idx = sort_order(in, keys, std::nullopt);
     std::vector<Column> ok;
-    for (const auto& k : spec.order) ok.push_back(k.expr.eval(in).flat());
+    for (const auto& k : spec.order) ok.push_back(k.expr.eval(in));
+    const RowCmp ocmp(ok, ok, spec.order);
     const KeyEq peq(pk, pk);
 
     // Partition and peer-group boundaries in sorted order.
@@ -326,8 +407,7 @@ inline Batch compute_window(const Batch& in, const std::vector<Expr>& exprs, con
     for (size_t i = 0; i < n; ++i) {
         const bool new_part = i == 0 || !peq(idx[i], idx[i - 1]);
         part_start[i] = new_part ? i : part_start[i - 1];
-        const bool new_peer = new_part || spec.order.empty() ||
-                              compare_rows(ok, idx[i], ok, idx[i - 1], spec.order) != 0;
+        const bool new_peer = new_part || spec.order.empty() || ocmp(idx[i], idx[i - 1]) != 0;
         peer_start[i] = new_peer ? i : peer_start[i - 1];
     }
     for (size_t i = n; i-- > 0;) {
@@ -675,8 +755,15 @@ private:
     }
 
     Phys window(const PlanPtr& n) {
-        const Phys in = run(n->input());
+        Phys in = run(n->input());
         const auto& spec = *n->exprs.at(0).strip_alias().window_spec();
+        if (n->group_limit > 0) {
+            bool ties = false;
+            for (const auto& e : n->exprs) ties |= e.strip_alias().func_name() == "rank";
+            const auto sp = n->exprs.at(0).strip_alias().window_spec();
+            const size_t k = n->group_limit;
+            in.rdd = in.rdd.map([sp, k, ties](const Batch& b) { return local_group_top(b, *sp, k, ties); });
+        }
         const size_t parts = spec.partition.empty() ? 1 : in.parts;
         const auto part_exprs = spec.partition;
         auto staged = in.rdd.flatMap([part_exprs, parts](const Batch& b) {

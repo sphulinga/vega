@@ -29,6 +29,7 @@ import pyarrow.parquet as pq
 from pysail.spark import SparkConnectServer
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 
 def write_tables(directory: Path, n: int, parts: int) -> tuple[str, str]:
@@ -100,6 +101,16 @@ def main() -> None:
                 .agg(F.count(F.lit(1)), F.sum("u")))),
             ("distinct (product, qty)", lambda: str(sales.select("product", "qty").distinct().count())),
             ("orderBy price desc limit 10", top10),
+            ("left join + filter region", lambda: row(
+                sales.join(stores, ["store"], "left").filter(col("region") == "r1")
+                .agg(F.count(F.lit(1)), F.sum("qty")))),
+            ("window top-3 per store", lambda: row(
+                sales.withColumn("rn", F.row_number().over(
+                    Window.partitionBy("store").orderBy(col("price").desc(), col("id").asc())))
+                .filter(col("rn") <= 3).agg(F.count(F.lit(1)), F.sum("id")))),
+            ("countDistinct product by category", lambda: row(
+                sales.groupBy("category").agg(F.countDistinct("product").alias("d"))
+                .agg(F.count(F.lit(1)), F.sum("d")))),
         ]
 
         for _ in range(warmup):

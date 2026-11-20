@@ -77,6 +77,9 @@ struct PlanNode {
     size_t limit = 0;
     // Repartition (keys: hash partitioning, empty: round robin)
     size_t partitions = 0;
+    // Window: only rows ranked <= group_limit per partition are needed
+    // (set by the optimizer when a rank filter follows; 0 = all)
+    size_t group_limit = 0;
 
     const PlanPtr& input(size_t i = 0) const { return inputs.at(i); }
 };
@@ -236,8 +239,9 @@ inline PlanPtr union_all(std::vector<PlanPtr> inputs) {
 
 // Window: appends one column per window expression (each aliased); all
 // expressions share one window specification.
-inline PlanPtr window(PlanPtr child, std::vector<Expr> exprs) {
+inline PlanPtr window(PlanPtr child, std::vector<Expr> exprs, size_t group_limit = 0) {
     auto n = std::make_shared<PlanNode>();
+    n->group_limit = group_limit;
     n->kind = PlanNode::Kind::Window;
     n->schema = child->schema;
     for (const auto& e : exprs) {
@@ -274,7 +278,7 @@ inline PlanPtr with_inputs(const PlanPtr& n, std::vector<PlanPtr> inputs) {
     case K::Sort: return sort(inputs[0], n->sort_keys);
     case K::Limit: return limit(inputs[0], n->limit);
     case K::Union: return union_all(std::move(inputs));
-    case K::Window: return window(inputs[0], n->exprs);
+    case K::Window: return window(inputs[0], n->exprs, n->group_limit);
     case K::Repartition: return repartition(inputs[0], n->partitions, n->keys);
     }
     return n;
@@ -368,7 +372,10 @@ inline std::string node_label(const PlanNode& n) {
     }
     case K::Limit: os << "Limit " << n.limit; break;
     case K::Union: os << "Union"; break;
-    case K::Window: os << "Window [" << list(n.exprs) << "]"; break;
+    case K::Window:
+        os << "Window [" << list(n.exprs) << "]";
+        if (n.group_limit) os << " limit " << n.group_limit << " per partition";
+        break;
     case K::Repartition: os << "Repartition " << n.partitions << (n.keys.empty() ? "" : " by [" + list(n.keys) + "]"); break;
     }
     return os.str();
