@@ -70,7 +70,8 @@ were interleaved across versions, and each cell is the best time over 8 runs.
 | chained shuffle | failed | 12.0 | 11.9 | fixed |
 
 v1.1.0 only changed the shutdown path (`ActorSystem::stop()`), so it performs
-the same as v1.0.0. Differences of 10-15% between them in this table are
+the same as v1.0.0. v2.0.0 added the C++ DataFrame API and did not change the
+PyVega client or server, so these numbers also hold for v2.0.0. Differences of 10-15% between them in this table are
 measurement noise: for example, 240 isolated `groupByKey` runs per version
 gave a fastest time of 8.5 ms for both, and a median of 11.2 ms (v1.0.0)
 versus 10.4 ms (v1.1.0).
@@ -148,6 +149,7 @@ How to read these:
 To reproduce (`pip install pyspark` provides Spark, which needs Java 17+):
 
 ```bash
+cmake -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --target vega_cpp_ops
 python benchmarks/bench_native_ops.py --engine vega-cpp --json vega_cpp.json
 python benchmarks/bench_native_ops.py --engine spark-scala --json spark_scala.json
@@ -231,7 +233,7 @@ How to read these numbers:
     rejects nulls (all three engines do this).
   - **The window query** keeps only each partition's top 3 rows per store
     before the shuffle, as Spark's `WindowGroupLimit` does. It went from 2 s to
-    52 ms.
+    52 ms. Sail sorts every row instead, which is why it is close to Spark here.
 - **Vega vs Sail.** Without those rules, the gaps come from Vega's execution
   itself:
   - dictionary-encoded string grouping (3.4×)
@@ -250,6 +252,7 @@ How to read these numbers:
 To reproduce:
 
 ```bash
+cmake -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --target vega_cpp_dataframe
 pip install pyspark                                   # Spark SQL (Java 17+)
 python -m venv sail && sail/bin/pip install pysail "pyspark-client==4.0.1" pyarrow
@@ -285,10 +288,12 @@ python benchmarks/bench_dataframe.py --n 10000000 --sail-python sail/bin/python
 For PyVega, the actor system runs **inside `vega_server`**. The Python process is a thin
 RPC client; worker threads are not separate OS processes.
 
-**Key difference from Spark:** there is no central scheduler in cluster mode. Peers
-discover each other via gossip and coordinate execution directly. In single-node /
-session-server mode, the JobActor still orchestrates stages but all workers are local
-threads.
+**Key difference from Spark:** there is no central scheduler in cluster mode.
+Peers discover each other via gossip, every peer runs the same program, and
+each computes the partitions it owns, exchanging shuffle data and results
+directly (see [Running on a cluster](#running-on-a-cluster-c)). The diagram
+above is single-node / session-server mode: the JobActor orchestrates stages
+and all workers are local threads.
 
 ### Actor framework
 
@@ -339,29 +344,47 @@ Full API: [Python RDD guide](docs/python-guide.md).
 
 ## Running on a cluster (C++)
 
-`vega_worker` runs **equal peers** (no special driver role). PyVega does not connect
-to cluster peers yet; use this for C++ multi-node examples.
+C++ programs can run on several processes or machines with `vega::Cluster`
+(`include/vega/cluster/cluster.hpp`). Peers are equal: there is no driver.
+Every peer runs **the same program** (SPMD):
+
+1. One peer `scatter`s the input.
+2. Each peer computes the partitions it owns (partition `p` belongs to peer
+   `p % n`, with peers ordered by id).
+3. Shuffle blocks and results go directly between peers.
+4. Every peer ends up with the full result of each `collect`.
+
+PyVega does not use cluster mode yet.
 
 ```bash
-# Terminal 1
-./build/vega_worker --bind 127.0.0.1:9001 --id peer-1
-
-# Terminal 2
-./build/vega_worker --bind 127.0.0.1:9002 --id peer-2 --seeds 127.0.0.1:9001
-
-# Terminal 3 — submitter (same binary, not a "driver")
+# Run the same example on three peers (three terminals or machines)
+./build/examples/cluster_word_count --bind 127.0.0.1:9001 --id peer-1 --expect-peers 3
+./build/examples/cluster_word_count --bind 127.0.0.1:9002 --id peer-2 \
+    --seeds 127.0.0.1:9001 --expect-peers 3
 ./build/examples/cluster_word_count --bind 127.0.0.1:9003 --id peer-3 \
     --seeds 127.0.0.1:9001 --expect-peers 3
 ```
 
-Single-node demo: `./build/examples/cluster_word_count --local`
+Peer 1 prints the word counts, and all three exit. Single-node demo:
+`./build/examples/cluster_word_count --local`.
 
 | Flag | Description |
 |------|-------------|
 | `--bind HOST:PORT` | Listen address |
 | `--seeds H1:P1,H2:P2` | Gossip seed peers |
 | `--id NAME` | Node identifier |
-| `--expect-peers N` | Wait for N peers before running (examples) |
+| `--expect-peers N` | Wait for N peers before running |
+
+Current limits:
+
+- **One shuffle per job.** A job may contain at most one shuffle (for example,
+  a single `reduceByKey` or `groupByKey`).
+- **Data stays in memory.** Nothing is written to disk.
+- **No fault tolerance.** A peer that dies stalls the job.
+- **`vega_worker` cannot run jobs.** It joins the gossip membership, but jobs
+  can't be shipped to it: C++ closures can't be sent to another process. Don't
+  let it join a cluster that runs jobs, because partitions would be assigned to
+  it.
 
 Details: [Server, workers, and clients](docs/server-and-workers.md).
 
@@ -382,8 +405,9 @@ int main() {
 
 ### Available operations
 
-The C++ RDD API covers `map`, `filter`, `flatMap`, `reduceByKey`, `groupByKey`
-and the `collect` / `count` / `reduce` / `foreach` actions.
+The C++ RDD API covers `map`, `filter`, `flatMap`, `union_with`, `reduceByKey`,
+`groupByKey` and the `collect` / `count` / `reduce` / `foreach` actions
+(`vega::Cluster` adds `scatter` and `collect` across peers).
 
 C++ also has columnar DataFrames (`#include <vega/dataframe.hpp>`), with Spark
 SQL semantics:
@@ -440,21 +464,27 @@ vega/
   docs/                      User guides (start at docs/README.md)
   include/vega/              C++ header-only library
     core/                    RDD, SparkContext, shuffle
+    dataframe/               DataFrames: columns, expressions, plans, optimizer
     actors/                  JobActor, WorkerActor, messages
     execution/               DAG builder, stages
     cluster/                 P2P cluster, gossip
     network/                 TCP framing, routing
+    transport/               Transport interface, in-process transport
+    serialization/           Binary serializers
+    client/                  PyVega wire protocol and native operator codes
+    python/                  GIL hooks for embedded Python
   src/
     vega_server.cpp          TCP session server (PyVega backend)
     server_session.cpp       Session RPC + embedded Python UDFs
-    vega_worker.cpp          Cluster peer daemon
-  src/server_module.cpp      Server as a Python extension (shipped in wheels)
+    server_module.cpp        Server as a Python extension (shipped in wheels)
+    vega_worker.cpp          Gossip peer daemon
   python/pyvega/             PyVega client package
   scripts/
     pyspark_compat/          PySpark RDD API shim
     run_pyspark_tests.py     Upstream Spark RDD tests vs PyVega
   third_party/spark/         Vendored Spark test sources
-  examples/                  word_count, cluster_word_count, benchmarks
+  examples/                  word_count, cluster_word_count, dataframe_example, benchmarks
+  benchmarks/                Version and Spark / Sail comparison benchmarks
   tests/                     C++ unit tests + Spark RDD suite ports
 ```
 
@@ -486,9 +516,14 @@ See [PySpark compatibility](docs/pyspark-compat.md).
 
 ### Multi-node C++ cluster
 
-1. Peers start and discover each other via gossip
-2. Submitter distributes partition data and task assignments over TCP
-3. Peers execute tasks and return serialized results
+1. Peers start, discover each other via gossip, and wait for the expected
+   number of peers
+2. Every peer runs the same program and builds the same lineage; one peer
+   scatters the input to each partition's owner
+3. Each peer computes the partitions it owns; shuffle blocks go directly to
+   the peer owning each reduce partition, and a map-done barrier marks the end
+   of the map phase
+4. Results are exchanged so every peer has the full result
 
 ## Contributing
 

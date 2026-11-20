@@ -5,7 +5,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <sys/socket.h>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "vega/cluster/node.hpp"
 #include "vega/network/endpoint.hpp"
@@ -39,7 +41,24 @@ public:
     uint16_t port() const { return port_; }
 
     void start() { server_.start(); }
-    void stop()  { server_.stop(); }
+
+    // Stop receiving and sending. Inbound connections are shut down first so
+    // their handler threads (blocked in recv) return, and outbound pooled
+    // connections are closed so remote peers' handlers return too; only then
+    // are the server threads joined. Without this, stop() blocked until every
+    // remote peer had closed its connection to us.
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(inbound_mu_);
+            stopping_ = true;
+            for (int fd : inbound_) ::shutdown(fd, SHUT_RDWR);
+        }
+        {
+            std::lock_guard<std::mutex> lock(pool_mu_);
+            pool_.clear();
+        }
+        server_.stop();
+    }
 
     // Register a handler for a specific message type.
     void on(NetMsgType type, MessageHandler handler) {
@@ -73,7 +92,27 @@ private:
     std::mutex pool_mu_;
     std::unordered_map<std::string, std::unique_ptr<TcpConnection>> pool_;
 
+    // Inbound connection fds, so stop() can unblock their readers. A
+    // connection leaves the set (under the lock) before it is closed, so
+    // stop() never touches a closed or reused descriptor.
+    std::mutex inbound_mu_;
+    std::unordered_set<int> inbound_;
+    bool stopping_ = false;
+
     void handle_connection(std::unique_ptr<TcpConnection> conn) {
+        {
+            std::lock_guard<std::mutex> lock(inbound_mu_);
+            if (stopping_) return;
+            inbound_.insert(conn->fd());
+        }
+        struct Unregister {
+            MessageRouter* self;
+            int fd;
+            ~Unregister() {
+                std::lock_guard<std::mutex> lock(self->inbound_mu_);
+                self->inbound_.erase(fd);
+            }
+        } unregister{this, conn->fd()};
         try {
             // Each connection may deliver multiple frames.
             while (conn->valid()) {

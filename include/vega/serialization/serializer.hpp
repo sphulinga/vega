@@ -37,6 +37,7 @@ enum class TypeTag : uint8_t {
 // ---------------------------------------------------------------------------
 
 inline void write_raw(ByteBuffer& buf, const void* src, size_t n) {
+    if (n == 0) return;  // src may be null (empty vector's data())
     const auto* p = static_cast<const uint8_t*>(src);
     buf.insert(buf.end(), p, p + n);
 }

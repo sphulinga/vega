@@ -66,15 +66,18 @@ public:
 
     void start() {
         if (running_.exchange(true)) return;
-        accept_thread_ = std::thread(&TcpServer::accept_loop, this);
+        accept_thread_ = std::thread(&TcpServer::accept_loop, this, listen_fd_);
     }
 
+    // Shut the listening socket down (waking accept()), join the accept
+    // thread, and only then close the descriptor, so the accept thread never
+    // sees it closed or reused.
     void stop() {
         if (!running_.exchange(false)) return;
         ::shutdown(listen_fd_, SHUT_RDWR);
+        if (accept_thread_.joinable()) accept_thread_.join();
         ::close(listen_fd_);
         listen_fd_ = -1;
-        if (accept_thread_.joinable()) accept_thread_.join();
         for (auto& t : conn_threads_)
             if (t.joinable()) t.join();
         conn_threads_.clear();
@@ -88,11 +91,11 @@ private:
     std::thread accept_thread_;
     std::vector<std::thread> conn_threads_;
 
-    void accept_loop() {
+    void accept_loop(int listen_fd) {
         while (running_.load()) {
             struct sockaddr_in peer{};
             socklen_t plen = sizeof(peer);
-            int fd = ::accept(listen_fd_,
+            int fd = ::accept(listen_fd,
                               reinterpret_cast<sockaddr*>(&peer), &plen);
             if (fd < 0) break;
             auto conn = std::make_unique<TcpConnection>(fd);
