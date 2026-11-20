@@ -64,6 +64,10 @@ Engine comparisons are like for like: `benchmarks/bench_python_ops.py
 `benchmarks/bench_native_ops.py --engine vega-cpp|spark-scala` compares Vega's
 C++ API with Spark's Scala API (build the `vega_cpp_ops` target; Spark needs
 Java 17+ and `pip install pyspark`, which bundles it).
+`benchmarks/bench_dataframe.py` compares Vega's C++ DataFrames with Spark SQL
+and Sail on the same queries, and checks that the engines agree (build the
+`vega_cpp_dataframe` target; Sail needs a Python with `pysail`,
+`pyspark-client==4.0.1` and `pyarrow`, passed with `--sail-python`).
 
 Releases: see [docs/releasing.md](docs/releasing.md).
 

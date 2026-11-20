@@ -11,6 +11,8 @@
 // Result types follow Spark SQL: sum(bigint) -> bigint, sum(double) ->
 // double, count -> bigint, avg -> double, min/max keep the input type.
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -84,33 +86,21 @@ inline Groups group_rows(const std::vector<Column>& keys, size_t rows) {
     }
     if (keys.size() == 1 && keys[0].type() == DType::Int64) {  // fast path
         const auto& v = keys[0].values<int64_t>();
-        std::unordered_map<int64_t, uint32_t> index;
-        index.reserve(rows / 4 + 16);
+        Int64GroupTable table(std::min<size_t>(rows, 4096));
         for (size_t r = 0; r < rows; ++r) {
-            auto [it, inserted] = index.try_emplace(v[r], static_cast<uint32_t>(g.first.size()));
+            auto [id, inserted] = table.find_or_insert(v[r]);
             if (inserted) g.first.push_back(static_cast<uint32_t>(r));
-            g.gid[r] = it->second;
+            g.gid[r] = id;
         }
         return g;
     }
-    // General keys: hash -> chain of groups with that hash.
-    std::unordered_map<uint64_t, uint32_t> head;
-    std::vector<uint32_t> next;
-    head.reserve(rows / 4 + 16);
-    constexpr uint32_t kNone = std::numeric_limits<uint32_t>::max();
+    GroupTable table(std::min<size_t>(rows, 4096));
+    const KeyHasher hash(keys);
+    const KeyEq eq(keys, keys);
     for (size_t r = 0; r < rows; ++r) {
-        const uint64_t h = row_hash(keys, r);
-        auto [it, inserted] = head.try_emplace(h, kNone);
-        uint32_t found = kNone;
-        for (uint32_t c = it->second; c != kNone; c = next[c])
-            if (rows_equal(keys, r, keys, g.first[c])) { found = c; break; }
-        if (found == kNone) {
-            found = static_cast<uint32_t>(g.first.size());
-            g.first.push_back(static_cast<uint32_t>(r));
-            next.push_back(it->second);
-            it->second = found;
-        }
-        g.gid[r] = found;
+        auto [id, inserted] = table.find_or_insert(hash(r), [&](uint32_t c) { return eq(r, g.first[c]); });
+        if (inserted) g.first.push_back(static_cast<uint32_t>(r));
+        g.gid[r] = id;
     }
     return g;
 }

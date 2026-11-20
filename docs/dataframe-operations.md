@@ -1,7 +1,12 @@
 # DataFrame-style operations
 
-PyVega today is an **RDD engine**. There is no Spark SQL catalog, no Catalyst optimizer,
-and no `SparkSession.createDataFrame` in the core client.
+PyVega (the Python client) is an **RDD API** today. There is no Spark SQL catalog
+and no `SparkSession.createDataFrame` in the Python client.
+
+> **C++ has native DataFrames.** Columnar, typed DataFrames with column
+> expressions, group-by, joins and top-N sorting run on the engine from C++.
+> See [C++ DataFrames](cpp-dataframes.md). Python bindings for them are not
+> available yet.
 
 This guide shows how to express common **DataFrame / SQL** patterns with RDDs, and
 clarifies what is and is not available.
@@ -10,14 +15,14 @@ clarifies what is and is not available.
 
 ## Status summary
 
-| Feature | PyVega | PySpark compat shim |
-|---------|--------|---------------------|
-| `SparkContext` / RDD | Yes | Yes |
-| `SparkSession` | No | Stub only |
-| `DataFrame` | No | No |
-| SQL (`spark.sql(...)`) | No | No |
-| Column expressions (`F.col`) | No | No |
-| Spark Connect server | No | No (separate `pysail` benchmarks) |
+| Feature | PyVega | PySpark compat shim | Vega C++ |
+|---------|--------|---------------------|----------|
+| `SparkContext` / RDD | Yes | Yes | Yes |
+| `SparkSession` | No | Stub only | No |
+| `DataFrame` | No | No | Yes ([guide](cpp-dataframes.md)) |
+| SQL (`spark.sql(...)`) | No | No | No |
+| Column expressions (`F.col`) | No | No | Yes (`col("x")`) |
+| Spark Connect server | No | No (separate `pysail` benchmarks) | No |
 
 For SQL-heavy workloads you still need Apache Spark (JVM) or another engine. For
 distributed Python data processing with UDFs, use the RDD API below.

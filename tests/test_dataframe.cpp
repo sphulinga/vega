@@ -296,3 +296,38 @@ TEST(DataFrameSerialization, BatchRoundTrip) {
     EXPECT_EQ(vals<std::string>(r, "c"), vals<std::string>(b, "c"));
     EXPECT_EQ(vals<uint8_t>(r, "d"), vals<uint8_t>(b, "d"));
 }
+
+TEST_F(DataFrameTest, FusedPipelineWithPruning) {
+    // Project -> filter -> join -> filter -> project, consumed by count,
+    // an aggregate that reads one column, and a full collect.
+    std::vector<int64_t> sid;
+    std::vector<std::string> region;
+    for (int64_t k = 0; k < 13; ++k) {
+        sid.push_back(k);
+        region.push_back(k % 2 ? "odd" : "even");
+    }
+    auto stores = DataFrame::from_columns(ctx, {{"store", Column(sid)}, {"region", Column(region)}}, 1);
+    auto df = sales_df(ctx, s, 4)
+                  .with_column("rev", col("qty") * col("price"))
+                  .filter(col("qty") > 1)
+                  .join(stores, {"store"})
+                  .filter(col("region") == "odd")
+                  .select({col("id"), col("rev"), lit(7).alias("seven")});
+    size_t want = 0;
+    double want_rev = 0;
+    for (size_t i = 0; i < s.id.size(); ++i)
+        if (s.qty[i] > 1 && s.store[i] % 2 == 1) {
+            ++want;
+            want_rev += s.qty[i] * s.price[i];
+        }
+    EXPECT_EQ(df.count(), want);
+    Batch a = df.agg({sum(col("rev")), sum(col("seven"))}).collect();
+    EXPECT_NEAR(a.column(0).values<double>()[0], want_rev, 1e-6);
+    EXPECT_EQ(a.column(1).values<int64_t>()[0], static_cast<int64_t>(7 * want));
+    Batch b = df.collect();
+    EXPECT_EQ(b.num_rows(), want);
+    EXPECT_EQ(schema_string(b.schema()), "[id: bigint, rev: double, seven: bigint]");
+    // count of a frame whose columns are all pruned away
+    EXPECT_EQ(sales_df(ctx, s, 3).select({lit(1).alias("one")}).count(), 1000u);
+    EXPECT_EQ(sales_df(ctx, s, 3).select({col("id")}).distinct().count(), 1000u);
+}

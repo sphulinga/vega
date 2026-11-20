@@ -2,6 +2,7 @@
 
 // Batch: a set of equal-length named columns -- one partition of a DataFrame.
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -41,11 +42,13 @@ class Batch {
 public:
     Batch() = default;
 
-    Batch(Schema schema, std::vector<Column> columns)
+    // `rows` only matters for a batch with no columns (e.g. after pruning
+    // every column away before a count); otherwise it comes from the columns.
+    Batch(Schema schema, std::vector<Column> columns, size_t rows = 0)
         : schema_(std::move(schema)), columns_(std::move(columns)) {
         if (schema_.size() != columns_.size())
             throw std::invalid_argument("Batch: schema/column count mismatch");
-        rows_ = columns_.empty() ? 0 : columns_.front().size();
+        rows_ = columns_.empty() ? rows : columns_.front().size();
         for (size_t i = 0; i < columns_.size(); ++i) {
             if (columns_[i].size() != rows_)
                 throw std::invalid_argument("Batch: columns have different lengths");
@@ -66,6 +69,17 @@ public:
     size_t num_rows() const { return rows_; }
     size_t num_columns() const { return columns_.size(); }
     const Column& column(size_t i) const { return columns_.at(i); }
+
+    // The named columns only, in the given order.
+    Batch project(const std::vector<std::string>& names) const {
+        Schema s;
+        std::vector<Column> cols;
+        for (const auto& n : names) {
+            cols.push_back(column(n));
+            s.push_back({n, cols.back().type()});
+        }
+        return Batch(std::move(s), std::move(cols), rows_);
+    }
     const std::vector<Column>& columns() const { return columns_; }
 
     const Column& column(const std::string& name) const {
@@ -79,22 +93,28 @@ public:
         std::vector<Column> cols;
         cols.reserve(columns_.size());
         for (const auto& c : columns_) cols.push_back(c.take(idx));
-        return Batch(schema_, std::move(cols));
+        return Batch(schema_, std::move(cols), idx.size());
     }
 
     Batch slice(size_t begin, size_t end) const {
         std::vector<Column> cols;
         cols.reserve(columns_.size());
         for (const auto& c : columns_) cols.push_back(c.slice(begin, end));
-        return Batch(schema_, std::move(cols));
+        end = std::min(end, rows_);
+        return Batch(schema_, std::move(cols), end > begin ? end - begin : 0);
     }
 
     // Concatenate batches with the same schema (empty input -> empty batch).
     static Batch concat(const std::vector<Batch>& parts, const Schema& schema) {
         std::vector<const Batch*> nonempty;
+        size_t total = 0;
         for (const auto& b : parts)
-            if (b.num_rows() > 0) nonempty.push_back(&b);
+            if (b.num_rows() > 0) {
+                nonempty.push_back(&b);
+                total += b.num_rows();
+            }
         if (nonempty.empty()) return empty(schema);
+        if (schema.empty()) return Batch(schema, {}, total);
         if (nonempty.size() == 1) return *nonempty.front();
         std::vector<Column> cols;
         cols.reserve(schema.size());
@@ -123,21 +143,46 @@ inline uint64_t mix_hash(uint64_t h, uint64_t v) {
     return h ^ (v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2));
 }
 
-inline uint64_t value_hash(const Column& c, size_t row) {
-    return c.visit([&](const auto& v) -> uint64_t {
-        using T = typename std::decay_t<decltype(v)>::value_type;
-        if constexpr (std::is_same_v<T, double>) {
-            const double d = v[row] == 0.0 ? 0.0 : v[row];  // -0.0 == 0.0
-            return std::hash<double>{}(d);
-        } else {
-            return std::hash<T>{}(v[row]);
-        }
-    });
+// splitmix64 finalizer: spreads identity-hashed integers over all 64 bits.
+inline uint64_t finalize_hash(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
 }
 
+template<typename T>
+inline uint64_t scalar_hash(const T& v) {
+    if constexpr (std::is_same_v<T, double>) {
+        return std::hash<double>{}(v == 0.0 ? 0.0 : v);  // -0.0 == 0.0
+    } else {
+        return std::hash<T>{}(v);
+    }
+}
+
+inline uint64_t value_hash(const Column& c, size_t row) {
+    return c.visit([&](const auto& v) -> uint64_t { return scalar_hash(v[row]); });
+}
+
+constexpr uint64_t kHashSeed = 0x84222325CBF29CE4ULL;
+
 inline uint64_t row_hash(const std::vector<Column>& keys, size_t row) {
-    uint64_t h = 0x84222325CBF29CE4ULL;
+    uint64_t h = kHashSeed;
     for (const auto& c : keys) h = mix_hash(h, value_hash(c, row));
+    return finalize_hash(h);
+}
+
+// row_hash of every row, computed column by column (one type dispatch per
+// column instead of per value).
+inline std::vector<uint64_t> hash_rows(const std::vector<Column>& keys, size_t rows) {
+    std::vector<uint64_t> h(rows, kHashSeed);
+    for (const auto& c : keys) {
+        c.visit([&](const auto& v) {
+            for (size_t r = 0; r < rows; ++r) h[r] = mix_hash(h[r], scalar_hash(v[r]));
+        });
+    }
+    for (auto& x : h) x = finalize_hash(x);
     return h;
 }
 
@@ -153,6 +198,182 @@ inline bool rows_equal(const std::vector<Column>& a, size_t ra,
     }
     return true;
 }
+
+// Row equality over key columns with the type dispatch done up front.
+class KeyEq {
+public:
+    KeyEq(const std::vector<Column>& a, const std::vector<Column>& b) {
+        for (size_t k = 0; k < a.size(); ++k) {
+            if (a[k].type() != b[k].type()) throw std::invalid_argument("key types differ");
+            cols_.push_back({a[k].type(), raw(a[k]), raw(b[k])});
+        }
+    }
+    bool operator()(size_t ra, size_t rb) const {
+        for (const auto& c : cols_) {
+            switch (c.type) {
+            case DType::Int64:
+                if (static_cast<const int64_t*>(c.a)[ra] != static_cast<const int64_t*>(c.b)[rb]) return false;
+                break;
+            case DType::Float64:
+                if (static_cast<const double*>(c.a)[ra] != static_cast<const double*>(c.b)[rb]) return false;
+                break;
+            case DType::String:
+                if (static_cast<const std::string*>(c.a)[ra] != static_cast<const std::string*>(c.b)[rb]) return false;
+                break;
+            case DType::Bool:
+                if (static_cast<const uint8_t*>(c.a)[ra] != static_cast<const uint8_t*>(c.b)[rb]) return false;
+                break;
+            }
+        }
+        return true;
+    }
+
+private:
+    struct Col {
+        DType type;
+        const void* a;
+        const void* b;
+    };
+    static const void* raw(const Column& c) {
+        return c.visit([](const auto& v) -> const void* { return v.data(); });
+    }
+    std::vector<Col> cols_;
+};
+
+// row_hash with the type dispatch done up front: hashes one row at a time
+// without a per-row visit or a temporary hash array.
+class KeyHasher {
+public:
+    explicit KeyHasher(const std::vector<Column>& keys) {
+        for (const auto& c : keys)
+            cols_.push_back({c.type(), c.visit([](const auto& v) -> const void* { return v.data(); })});
+    }
+    uint64_t operator()(size_t r) const {
+        uint64_t h = kHashSeed;
+        for (const auto& c : cols_) {
+            switch (c.type) {
+            case DType::Int64: h = mix_hash(h, scalar_hash(static_cast<const int64_t*>(c.p)[r])); break;
+            case DType::Float64: h = mix_hash(h, scalar_hash(static_cast<const double*>(c.p)[r])); break;
+            case DType::String: h = mix_hash(h, scalar_hash(static_cast<const std::string*>(c.p)[r])); break;
+            case DType::Bool: h = mix_hash(h, scalar_hash(static_cast<const uint8_t*>(c.p)[r])); break;
+            }
+        }
+        return finalize_hash(h);
+    }
+
+private:
+    struct Col {
+        DType type;
+        const void* p;
+    };
+    std::vector<Col> cols_;
+};
+
+// Open-addressing map from int64 key to dense id, with keys stored inline
+// (the single-integer-key fast path for grouping).
+class Int64GroupTable {
+public:
+    explicit Int64GroupTable(size_t expected = 16) { reset(expected); }
+
+    std::pair<uint32_t, bool> find_or_insert(int64_t key) {
+        if ((size_ + 1) * 2 > slots_.size()) grow();
+        for (size_t i = finalize_hash(static_cast<uint64_t>(key)) & mask_;; i = (i + 1) & mask_) {
+            Slot& s = slots_[i];
+            if (s.id == kEmpty) {
+                s = {key, static_cast<uint32_t>(size_++)};
+                return {s.id, true};
+            }
+            if (s.key == key) return {s.id, false};
+        }
+    }
+
+private:
+    static constexpr uint32_t kEmpty = 0xFFFFFFFFu;
+    struct Slot {
+        int64_t key;
+        uint32_t id;
+    };
+    void reset(size_t expected) {
+        size_t cap = 16;
+        while (cap < expected * 2) cap <<= 1;
+        slots_.assign(cap, Slot{0, kEmpty});
+        mask_ = cap - 1;
+    }
+    void grow() {
+        std::vector<Slot> old = std::move(slots_);
+        reset(old.size());
+        for (const Slot& s : old) {
+            if (s.id == kEmpty) continue;
+            size_t i = finalize_hash(static_cast<uint64_t>(s.key)) & mask_;
+            while (slots_[i].id != kEmpty) i = (i + 1) & mask_;
+            slots_[i] = s;
+        }
+    }
+    std::vector<Slot> slots_;
+    size_t mask_ = 0;
+    size_t size_ = 0;
+};
+
+// Open-addressing hash table from row hash to group id (ids are dense,
+// assigned in insertion order). The caller resolves hash collisions with an
+// equality callback against each candidate group's representative row.
+class GroupTable {
+public:
+    explicit GroupTable(size_t expected = 16) {
+        size_t cap = 16;
+        while (cap < expected * 2) cap <<= 1;
+        slots_.assign(cap, kEmpty);
+        mask_ = cap - 1;
+    }
+
+    size_t size() const { return hashes_.size(); }
+
+    // Returns {group id, inserted}. `eq(gid)` says whether the row being
+    // inserted equals group `gid`'s key.
+    template<typename Eq>
+    std::pair<uint32_t, bool> find_or_insert(uint64_t h, Eq&& eq) {
+        if ((hashes_.size() + 1) * 2 > slots_.size()) grow();
+        for (size_t i = h & mask_;; i = (i + 1) & mask_) {
+            const uint32_t g = slots_[i];
+            if (g == kEmpty) {
+                const auto id = static_cast<uint32_t>(hashes_.size());
+                slots_[i] = id;
+                hashes_.push_back(h);
+                return {id, true};
+            }
+            if (hashes_[g] == h && eq(g)) return {g, false};
+        }
+    }
+
+    // Lookup only; returns kEmpty when absent.
+    template<typename Eq>
+    uint32_t find(uint64_t h, Eq&& eq) const {
+        for (size_t i = h & mask_;; i = (i + 1) & mask_) {
+            const uint32_t g = slots_[i];
+            if (g == kEmpty) return kEmpty;
+            if (hashes_[g] == h && eq(g)) return g;
+        }
+    }
+
+    static constexpr uint32_t kEmpty = 0xFFFFFFFFu;
+
+private:
+    void grow() {
+        std::vector<uint32_t> next(slots_.size() * 2, kEmpty);
+        const size_t mask = next.size() - 1;
+        for (uint32_t g = 0; g < hashes_.size(); ++g) {
+            size_t i = hashes_[g] & mask;
+            while (next[i] != kEmpty) i = (i + 1) & mask;
+            next[i] = g;
+        }
+        slots_ = std::move(next);
+        mask_ = mask;
+    }
+
+    std::vector<uint32_t> slots_;
+    std::vector<uint64_t> hashes_;
+    size_t mask_ = 0;
+};
 
 }  // namespace vega::df
 
@@ -203,6 +424,7 @@ struct Serializer<df::Column> {
 template<>
 struct Serializer<df::Batch> {
     static void serialize(const df::Batch& b, ByteBuffer& buf) {
+        write_pod<uint64_t>(buf, b.num_rows());
         write_pod<uint32_t>(buf, static_cast<uint32_t>(b.num_columns()));
         for (size_t i = 0; i < b.num_columns(); ++i) {
             Serializer<std::string>::serialize(b.schema()[i].name, buf);
@@ -210,6 +432,7 @@ struct Serializer<df::Batch> {
         }
     }
     static df::Batch deserialize(const ByteBuffer& buf, size_t& off) {
+        const auto rows = static_cast<size_t>(read_pod<uint64_t>(buf, off));
         const auto ncols = read_pod<uint32_t>(buf, off);
         df::Schema schema;
         std::vector<df::Column> cols;
@@ -219,7 +442,7 @@ struct Serializer<df::Batch> {
             schema.push_back({std::move(name), col.type()});
             cols.push_back(std::move(col));
         }
-        return df::Batch(std::move(schema), std::move(cols));
+        return df::Batch(std::move(schema), std::move(cols), rows);
     }
 };
 

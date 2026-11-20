@@ -7,6 +7,9 @@ target_link_libraries(cluster_word_count PRIVATE vega)
 add_executable(core_benchmark core_benchmark.cpp)
 target_link_libraries(core_benchmark PRIVATE vega)
 
+add_executable(dataframe_example dataframe_example.cpp)
+target_link_libraries(dataframe_example PRIVATE vega)
+
 add_executable(shuffle_benchmark shuffle_benchmark.cpp)
 target_link_libraries(shuffle_benchmark PRIVATE vega)
 
@@ -14,3 +17,8 @@ target_link_libraries(shuffle_benchmark PRIVATE vega)
 # Scala Spark); run through benchmarks/bench_vega_cpp_ops.py or directly.
 add_executable(vega_cpp_ops ${PROJECT_SOURCE_DIR}/benchmarks/vega_cpp_ops.cpp)
 target_link_libraries(vega_cpp_ops PRIVATE vega)
+
+# Vega C++ DataFrame benchmark (vs Spark SQL and Sail); run through
+# benchmarks/bench_dataframe.py or directly.
+add_executable(vega_cpp_dataframe ${PROJECT_SOURCE_DIR}/benchmarks/vega_cpp_dataframe.cpp)
+target_link_libraries(vega_cpp_dataframe PRIVATE vega)

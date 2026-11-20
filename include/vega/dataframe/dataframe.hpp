@@ -13,8 +13,16 @@
 //
 // A DataFrame is an RDD of columnar Batches (one or more per partition) plus
 // a schema. Operations compile to RDD stages and run in parallel on the actor
-// system: column-wise operations are narrow per-batch stages; group_by uses
-// a two-phase hash aggregate with an engine shuffle between the phases.
+// system:
+//
+//   * select / with_column / filter / join are narrow operations. They are
+//     queued and fused into a single per-batch stage, and only the columns a
+//     later step reads are carried through it (column pruning), so e.g.
+//     `df.filter(p).count()` never copies a column it does not test;
+//   * group_by(...).agg(...) and distinct() run a two-phase hash aggregate
+//     with an engine shuffle between the phases;
+//   * order_by sorts partitions in parallel and k-way merges them; a
+//     following limit(n) keeps only n rows per partition (top-N).
 //
 // Current limits: values are never null; joins are inner equi-joins using a
 // broadcast hash join (the right side is collected once and shared, as Spark
@@ -27,10 +35,10 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -48,12 +56,91 @@ inline SortKey desc(Expr e) { return {std::move(e), false}; }
 
 class GroupedData;
 
+namespace detail {
+
+// The build side of a broadcast hash join.
+struct JoinIndex {
+    Batch build;
+    std::vector<std::string> keys;        // key column names (both sides)
+    std::vector<Column> key_cols;         // build-side key columns
+    std::vector<std::string> right_cols;  // build-side non-key columns, in output order
+    GroupTable table;                     // distinct build keys -> slot
+    std::vector<std::vector<uint32_t>> rows;  // build rows of each distinct key
+};
+
+// One queued narrow operation.
+struct NarrowOp {
+    enum class Kind { Project, Filter, Join } kind;
+    std::vector<Expr> exprs;  // Project: output expressions; Filter: {predicate}
+    std::shared_ptr<const JoinIndex> join;
+};
+
+using NameSet = std::set<std::string>;
+
+inline void add_refs(const Expr& e, NameSet& out) {
+    std::vector<std::string> refs;
+    e.referenced_columns(refs);
+    out.insert(refs.begin(), refs.end());
+}
+
+// A narrow op specialized to the columns its consumers need.
+struct PrunedOp {
+    NarrowOp::Kind kind = NarrowOp::Kind::Project;
+    std::vector<Expr> exprs;
+    std::shared_ptr<const JoinIndex> join;
+    std::vector<std::string> join_right;  // build columns to emit
+};
+
+inline Batch apply_filter(const Batch& b, const Expr& predicate) {
+    const Column mask = predicate.eval(b);
+    const auto& m = mask.values<uint8_t>();
+    std::vector<uint32_t> keep;
+    keep.reserve(m.size());
+    for (size_t i = 0; i < m.size(); ++i)
+        if (m[i]) keep.push_back(static_cast<uint32_t>(i));
+    return keep.size() == b.num_rows() ? b : b.take(keep);
+}
+
+inline Batch apply_join(const Batch& b, const JoinIndex& idx, const std::vector<std::string>& right) {
+    std::vector<Column> keys;
+    for (const auto& k : idx.keys) keys.push_back(b.column(k));
+    const KeyHasher hash(keys);
+    const KeyEq eq(keys, idx.key_cols);
+    std::vector<uint32_t> li, ri;
+    li.reserve(b.num_rows());
+    ri.reserve(b.num_rows());
+    for (size_t r = 0; r < b.num_rows(); ++r) {
+        const uint32_t slot =
+            idx.table.find(hash(r), [&](uint32_t s) { return eq(r, idx.rows[s].front()); });
+        if (slot == GroupTable::kEmpty) continue;
+        for (uint32_t rr : idx.rows[slot]) {
+            li.push_back(static_cast<uint32_t>(r));
+            ri.push_back(rr);
+        }
+    }
+    // Every left row matched exactly once (the common foreign-key join):
+    // the left columns pass through untouched.
+    bool identity = li.size() == b.num_rows();
+    for (size_t i = 0; identity && i < li.size(); ++i) identity = li[i] == i;
+    Schema schema = b.schema();
+    std::vector<Column> cols;
+    for (const auto& c : b.columns()) cols.push_back(identity ? c : c.take(li));
+    for (const auto& name : right) {
+        cols.push_back(idx.build.column(name).take(ri));
+        schema.push_back({name, cols.back().type()});
+    }
+    return Batch(std::move(schema), std::move(cols), li.size());
+}
+
+}  // namespace detail
+
 class DataFrame {
 public:
     using Rdd = vega::RDD<Batch>;
 
     DataFrame(vega::SparkContext* ctx, Rdd rdd, Schema schema, size_t partitions)
-        : ctx_(ctx), rdd_(std::move(rdd)), schema_(std::move(schema)),
+        : ctx_(ctx), base_(std::move(rdd)), base_schema_(schema), schema_(std::move(schema)),
+          ops_(std::make_shared<const std::vector<detail::NarrowOp>>()),
           parts_(std::max<size_t>(1, partitions)) {}
 
     // Split a batch into `partitions` contiguous slices.
@@ -77,6 +164,7 @@ public:
             schema.push_back({name, c.type()});
             cols.push_back(std::move(c));
         }
+        check_unique(schema);
         return from_batch(ctx, Batch(std::move(schema), std::move(cols)), partitions);
     }
 
@@ -87,17 +175,10 @@ public:
 
     DataFrame select(std::vector<Expr> exprs) const {
         const DataFrame& in = resolved();
-        auto plan = std::make_shared<const std::vector<Expr>>(std::move(exprs));
         Schema out;
-        for (const auto& e : *plan) out.push_back({e.name(), e.type(in.schema_)});
+        for (const auto& e : exprs) out.push_back({e.name(), e.type(in.schema_)});
         check_unique(out);
-        auto rdd = in.rdd_.map([plan, out](const Batch& b) {
-            std::vector<Column> cols;
-            cols.reserve(plan->size());
-            for (const auto& e : *plan) cols.push_back(e.eval(b));
-            return Batch(out, std::move(cols));
-        });
-        return DataFrame(ctx_, std::move(rdd), std::move(out), in.parts_);
+        return in.with_op({detail::NarrowOp::Kind::Project, std::move(exprs), nullptr}, std::move(out));
     }
 
     // Add a column, or replace the one with the same name.
@@ -120,16 +201,7 @@ public:
         const DataFrame& in = resolved();
         if (predicate.type(in.schema_) != DType::Bool)
             throw std::invalid_argument("filter needs a boolean expression: " + predicate.name());
-        auto rdd = in.rdd_.map([predicate](const Batch& b) {
-            const Column mask = predicate.eval(b);
-            const auto& m = mask.values<uint8_t>();
-            std::vector<uint32_t> keep;
-            keep.reserve(m.size());
-            for (size_t i = 0; i < m.size(); ++i)
-                if (m[i]) keep.push_back(static_cast<uint32_t>(i));
-            return keep.size() == b.num_rows() ? b : b.take(keep);
-        });
-        return DataFrame(ctx_, std::move(rdd), in.schema_, in.parts_);
+        return in.with_op({detail::NarrowOp::Kind::Filter, {predicate}, nullptr}, in.schema_);
     }
     DataFrame where(const Expr& predicate) const { return filter(predicate); }
 
@@ -140,63 +212,41 @@ public:
 
     // Inner equi-join on columns with the same names on both sides
     // (like Spark's df.join(other, Seq("k"))). The right side is collected
-    // and broadcast to every partition of the left side.
+    // and broadcast to every partition of the left side; output columns are
+    // the left side's, then the right side's non-key columns.
     DataFrame join(const DataFrame& right, const std::vector<std::string>& on) const {
         const DataFrame& left = resolved();
         if (on.empty()) throw std::invalid_argument("join needs at least one key column");
-        const Batch build = right.collect();
-        std::vector<int> lk, rk;
+        auto idx = std::make_shared<detail::JoinIndex>();
+        idx->build = right.collect();
+        idx->keys = on;
         for (const auto& k : on) {
-            const int li = schema_index(left.schema_, k), ri = schema_index(build.schema(), k);
+            const int li = schema_index(left.schema_, k), ri = schema_index(idx->build.schema(), k);
             if (li < 0 || ri < 0) throw std::invalid_argument("join key '" + k + "' missing");
-            if (left.schema_[li].type != build.schema()[ri].type)
+            if (left.schema_[static_cast<size_t>(li)].type !=
+                idx->build.schema()[static_cast<size_t>(ri)].type)
                 throw std::invalid_argument("join key '" + k + "' has different types");
-            lk.push_back(li);
-            rk.push_back(ri);
+            idx->key_cols.push_back(idx->build.column(static_cast<size_t>(ri)));
         }
-        // Output: all left columns, then the right side's non-key columns.
         Schema out = left.schema_;
-        std::vector<size_t> right_cols;
-        for (size_t c = 0; c < build.num_columns(); ++c) {
-            if (std::find(rk.begin(), rk.end(), static_cast<int>(c)) != rk.end()) continue;
-            out.push_back(build.schema()[c]);
-            right_cols.push_back(c);
+        for (const auto& f : idx->build.schema()) {
+            if (std::find(on.begin(), on.end(), f.name) != on.end()) continue;
+            out.push_back(f);
+            idx->right_cols.push_back(f.name);
         }
         check_unique(out);
 
-        struct Index {
-            Batch build;
-            std::vector<Column> keys;
-            std::unordered_map<uint64_t, std::vector<uint32_t>> rows;
-        };
-        auto index = std::make_shared<Index>();
-        index->build = build;
-        for (int c : rk) index->keys.push_back(build.column(static_cast<size_t>(c)));
-        index->rows.reserve(build.num_rows());
-        for (size_t r = 0; r < build.num_rows(); ++r)
-            index->rows[row_hash(index->keys, r)].push_back(static_cast<uint32_t>(r));
-        std::shared_ptr<const Index> idx = index;
-
-        auto rdd = left.rdd_.map([idx, lk, right_cols, out](const Batch& b) {
-            std::vector<Column> keys;
-            for (int c : lk) keys.push_back(b.column(static_cast<size_t>(c)));
-            std::vector<uint32_t> li, ri;
-            for (size_t r = 0; r < b.num_rows(); ++r) {
-                auto it = idx->rows.find(row_hash(keys, r));
-                if (it == idx->rows.end()) continue;
-                for (uint32_t rr : it->second) {
-                    if (rows_equal(keys, r, idx->keys, rr)) {
-                        li.push_back(static_cast<uint32_t>(r));
-                        ri.push_back(rr);
-                    }
-                }
-            }
-            std::vector<Column> cols;
-            for (const auto& c : b.columns()) cols.push_back(c.take(li));
-            for (size_t c : right_cols) cols.push_back(idx->build.column(c).take(ri));
-            return Batch(out, std::move(cols));
-        });
-        return DataFrame(ctx_, std::move(rdd), std::move(out), left.parts_);
+        const size_t rows = idx->build.num_rows();
+        idx->table = GroupTable(rows);
+        const std::vector<uint64_t> h = hash_rows(idx->key_cols, rows);
+        const KeyEq eq(idx->key_cols, idx->key_cols);
+        for (size_t r = 0; r < rows; ++r) {
+            auto [slot, inserted] =
+                idx->table.find_or_insert(h[r], [&](uint32_t s) { return eq(r, idx->rows[s].front()); });
+            if (inserted) idx->rows.emplace_back();
+            idx->rows[slot].push_back(static_cast<uint32_t>(r));
+        }
+        return left.with_op({detail::NarrowOp::Kind::Join, {}, std::move(idx)}, std::move(out));
     }
 
     DataFrame distinct() const {
@@ -222,8 +272,7 @@ public:
     // First n rows (of the sort order, after order_by).
     DataFrame limit(size_t n) const {
         if (pending_sort_) return sorted(n);
-        auto rdd = rdd_.map([n](const Batch& b) { return b.slice(0, n); });
-        std::vector<Batch> parts = rdd.collect();
+        auto parts = rdd().map([n](const Batch& b) { return b.slice(0, n); }).collect();
         Batch all = Batch::concat(parts, schema_);
         return from_batch(*ctx_, all.slice(0, n), 1);
     }
@@ -231,7 +280,8 @@ public:
     // ----- actions ------------------------------------------------------------
 
     size_t count() const {
-        auto counts = rdd_.map([](const Batch& b) { return static_cast<int64_t>(b.num_rows()); })
+        auto counts = rdd(detail::NameSet{})
+                          .map([](const Batch& b) { return static_cast<int64_t>(b.num_rows()); })
                           .collect();
         size_t total = 0;
         for (int64_t c : counts) total += static_cast<size_t>(c);
@@ -240,7 +290,7 @@ public:
 
     Batch collect() const {
         if (pending_sort_) return sorted(std::nullopt).collect();
-        return Batch::concat(rdd_.collect(), schema_);
+        return Batch::concat(rdd().collect(), schema_);
     }
 
     // Render the first n rows as a text table (like Spark's show()).
@@ -286,6 +336,92 @@ public:
 private:
     friend class GroupedData;
 
+    DataFrame with_op(detail::NarrowOp op, Schema out) const {
+        DataFrame d = *this;
+        auto ops = std::make_shared<std::vector<detail::NarrowOp>>(*ops_);
+        ops->push_back(std::move(op));
+        d.ops_ = std::move(ops);
+        d.schema_ = std::move(out);
+        d.sorted_cache_.reset();
+        return d;
+    }
+
+    // The RDD of this DataFrame's batches with the queued narrow operations
+    // fused into one stage. With `needed`, only those output columns are
+    // produced, and every column no later step reads is dropped as early as
+    // possible (all columns when omitted).
+    Rdd rdd(std::optional<detail::NameSet> needed = std::nullopt) const {
+        using detail::NarrowOp;
+        detail::NameSet need;
+        if (needed) {
+            need = *needed;
+        } else {
+            for (const auto& f : schema_) need.insert(f.name);
+        }
+        const bool all_out = !needed || need.size() == schema_.size();
+        if (ops_->empty() && all_out) return base_;
+
+        // Walk the ops backwards, keeping only what consumers need.
+        std::vector<detail::PrunedOp> plan(ops_->size());
+        for (size_t i = ops_->size(); i-- > 0;) {
+            const NarrowOp& op = (*ops_)[i];
+            detail::PrunedOp& p = plan[i];
+            p.kind = op.kind;
+            switch (op.kind) {
+            case NarrowOp::Kind::Project: {
+                detail::NameSet in;
+                for (const auto& e : op.exprs) {
+                    if (!need.count(e.name())) continue;
+                    p.exprs.push_back(e);
+                    detail::add_refs(e, in);
+                }
+                need = std::move(in);
+                break;
+            }
+            case NarrowOp::Kind::Filter:
+                p.exprs = op.exprs;
+                detail::add_refs(op.exprs[0], need);
+                break;
+            case NarrowOp::Kind::Join:
+                p.join = op.join;
+                for (const auto& c : op.join->right_cols)
+                    if (need.erase(c)) p.join_right.push_back(c);
+                need.insert(op.join->keys.begin(), op.join->keys.end());
+                break;
+            }
+        }
+        std::vector<std::string> base_cols;
+        for (const auto& f : base_schema_)
+            if (need.count(f.name)) base_cols.push_back(f.name);
+
+        // Output columns, in schema order.
+        std::vector<std::string> out_cols;
+        for (const auto& f : schema_)
+            if (!needed || needed->count(f.name)) out_cols.push_back(f.name);
+
+        auto steps = std::make_shared<const std::vector<detail::PrunedOp>>(std::move(plan));
+        return base_.map([steps, base_cols, out_cols](const Batch& in) {
+            Batch b = in.project(base_cols);
+            for (const auto& p : *steps) {
+                switch (p.kind) {
+                case NarrowOp::Kind::Project: {
+                    Schema s;
+                    std::vector<Column> cols;
+                    for (const auto& e : p.exprs) {
+                        cols.push_back(e.eval(b));
+                        s.push_back({e.name(), cols.back().type()});
+                    }
+                    b = Batch(std::move(s), std::move(cols), b.num_rows());
+                    break;
+                }
+                case NarrowOp::Kind::Filter: b = detail::apply_filter(b, p.exprs[0]); break;
+                case NarrowOp::Kind::Join: b = detail::apply_join(b, *p.join, p.join_right); break;
+                }
+            }
+            return b.project(out_cols);
+        });
+    }
+
     // This DataFrame with any pending sort applied.
     const DataFrame& resolved() const {
         if (!pending_sort_) return *this;
@@ -297,11 +433,15 @@ private:
         const DataFrame& in = resolved();
         auto plan = std::make_shared<const AggPlan>(std::move(keys), std::move(aggs), in.schema_);
         check_unique(plan->output_schema);
+        detail::NameSet needed;
+        for (const auto& k : plan->keys) detail::add_refs(k, needed);
+        for (const auto& a : plan->aggs)
+            if (a.input()) detail::add_refs(*a.input(), needed);
         const size_t nk = plan->key_schema.size();
         const size_t parts = nk == 0 ? 1 : in.parts_;  // shuffle partitions
 
         // Stage 1: partial aggregate, then split by key hash into buckets.
-        auto staged = in.rdd_.flatMap([plan, nk, parts](const Batch& b) {
+        auto staged = in.rdd(needed).flatMap([plan, nk, parts](const Batch& b) {
             Batch p = plan->partial(b);
             std::vector<std::pair<int, Batch>> out;
             if (parts == 1) {
@@ -310,9 +450,10 @@ private:
             }
             std::vector<Column> keys(p.columns().begin(),
                                      p.columns().begin() + static_cast<std::ptrdiff_t>(nk));
+            const std::vector<uint64_t> h = hash_rows(keys, p.num_rows());
             std::vector<std::vector<uint32_t>> buckets(parts);
             for (size_t r = 0; r < p.num_rows(); ++r)
-                buckets[row_hash(keys, r) % parts].push_back(static_cast<uint32_t>(r));
+                buckets[(h[r] >> 32) % parts].push_back(static_cast<uint32_t>(r));
             for (size_t k = 0; k < parts; ++k)
                 if (!buckets[k].empty()) out.emplace_back(static_cast<int>(k), p.take(buckets[k]));
             return out;
@@ -344,18 +485,21 @@ private:
     // then k-way merge the sorted runs into one partition.
     DataFrame sorted(std::optional<size_t> limit) const {
         auto keys = pending_sort_;
-        auto runs_rdd = rdd_.map([keys, limit](const Batch& b) {
+        auto runs_rdd = rdd().map([keys, limit](const Batch& b) {
             std::vector<Column> kc;
             for (const auto& k : *keys) kc.push_back(k.expr.eval(b));
             std::vector<uint32_t> idx(b.num_rows());
             for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<uint32_t>(i);
-            auto less = [&](uint32_t x, uint32_t y) { return compare_rows(kc, x, kc, y, *keys) < 0; };
+            auto less = [&](uint32_t x, uint32_t y) {
+                const int c = compare_rows(kc, x, kc, y, *keys);
+                return c != 0 ? c < 0 : x < y;  // stable
+            };
             if (limit && *limit < idx.size()) {
                 std::partial_sort(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(*limit),
                                   idx.end(), less);
                 idx.resize(*limit);
             } else {
-                std::stable_sort(idx.begin(), idx.end(), less);
+                std::sort(idx.begin(), idx.end(), less);
             }
             return b.take(idx);
         });
@@ -401,8 +545,10 @@ private:
     }
 
     vega::SparkContext* ctx_;
-    Rdd rdd_;
-    Schema schema_;
+    Rdd base_;            // materialized input
+    Schema base_schema_;  // its schema
+    Schema schema_;       // schema after the queued narrow ops
+    std::shared_ptr<const std::vector<detail::NarrowOp>> ops_;
     size_t parts_;
     std::shared_ptr<const std::vector<SortKey>> pending_sort_;
     mutable std::shared_ptr<DataFrame> sorted_cache_;

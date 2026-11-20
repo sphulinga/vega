@@ -71,6 +71,15 @@ public:
 
     bool is_column() const { return n_->kind == Kind::Column; }
 
+    // Names of the input columns the expression reads (appended to `out`).
+    void referenced_columns(std::vector<std::string>& out) const {
+        if (n_->kind == Kind::Column) {
+            out.push_back(n_->name);
+            return;
+        }
+        for (const auto& c : n_->children) c.referenced_columns(out);
+    }
+
     // Result type against a schema; also validates the expression.
     DType type(const Schema& schema) const {
         switch (n_->kind) {

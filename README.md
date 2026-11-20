@@ -17,7 +17,8 @@ Python UDF support.
 | [Getting started](docs/getting-started.md) | Build, install, first program |
 | [Server, workers, and clients](docs/server-and-workers.md) | `vega_server`, worker threads, cluster peers |
 | [Python RDD guide](docs/python-guide.md) | PyVega API reference with examples |
-| [DataFrame-style operations](docs/dataframe-operations.md) | SQL-like patterns using RDDs |
+| [C++ DataFrames](docs/cpp-dataframes.md) | Native columnar DataFrames: expressions, group-by, joins, top-N |
+| [DataFrame-style operations](docs/dataframe-operations.md) | SQL-like patterns using RDDs from Python |
 | [PySpark compatibility](docs/pyspark-compat.md) | Run PySpark RDD code and upstream tests |
 | [Vega extras](docs/vega-extras.md) | Operations beyond Spark's RDD API |
 | [Releasing](docs/releasing.md) | Building wheels and publishing to PyPI |
@@ -173,7 +174,75 @@ Where the gains come from:
 - **Native numeric actions.** `sum`/`mean`/`stats`/`max`/`min` on int/float RDDs
   run in C++ (integer sums are exact, using 128-bit accumulators).
 
-> **Note:** PyVega provides **RDD** APIs, not Spark SQL DataFrames. See
+### DataFrames: Vega C++ vs Spark SQL vs Sail
+
+Vega's native C++ DataFrames ([C++ DataFrames](docs/cpp-dataframes.md))
+compared with [Spark SQL](https://spark.apache.org/sql/) 4.3.0, through the
+Scala DataFrame API, and with [Sail](https://github.com/lakehq/sail) 0.7.3, a
+Rust Spark Connect server built on DataFusion and driven through the PySpark
+Connect client. All three run the same nine queries over the same generated
+10M-row `sales` table (`id`, `store`, `product`, `qty`, `price`, `category`
+string) and a 1,000-row `stores` table.
+
+The setup:
+
+- Every engine gets 4 cores and 8 partitions, also used as the shuffle
+  partition count (`spark.sql.shuffle.partitions=8`).
+- Each cell is the best of 5 repetitions after a warm-up pass, over 2 rounds
+  with the engines run in rotating order.
+- Every query returns numbers that the runner checks across engines, and they
+  matched: integers exactly, floating-point sums to within 1e-9 relative.
+
+Lower is better; the fastest engine for each query is in bold.
+
+| Query (10M rows) | Vega C++ | Spark SQL | Sail |
+|------------------|---------:|----------:|-----:|
+| `filter(qty > 5 && price < 50).count()` | **17 ms** | 154 ms | 20 ms |
+| `agg(sum(qty * price))` | **13 ms** | 141 ms | 15 ms |
+| `groupBy(store)` (1k keys): `sum`, `avg` | **19 ms** | 241 ms | 31 ms |
+| `groupBy(category)` (string, 8 keys): `sum(qty * price)`, `count` | 50 ms | 419 ms | **48 ms** |
+| `groupBy(product)` (100k keys): `count`, `max` | **59 ms** | 391 ms | 88 ms |
+| `groupBy(category, qty)` (40 keys): `count`, `sum` | **50 ms** | 396 ms | 65 ms |
+| `join(stores, "store").groupBy(region).sum(qty)` | 125 ms | 472 ms | **51 ms** |
+| `select(product, qty).distinct().count()` | 93 ms | 406 ms | **86 ms** |
+| `orderBy(price desc, id).limit(10)` | **16 ms** | 236 ms | 33 ms |
+
+How to read these numbers:
+
+- **Data placement differs by engine.**
+  - Vega holds the table as in-memory columns.
+  - Spark reads it from its in-memory columnar cache (`df.cache()`).
+  - Sail cannot cache DataFrames yet (`cache()` is a no-op), so it scans the
+    table on every query from uncompressed Parquet in the OS page cache. That
+    is Sail's native input, and its scan is cheap: a full `count()` takes about
+    4 ms.
+- **Vega vs Sail.** Vega is 1.15–2.1× faster on six of the nine queries.
+  Single-integer keys, low-cardinality multi-key grouping and top-N are its
+  strong cases.
+  - Sail wins the join by about 2.5×. Vega's broadcast join materializes the
+    joined `region` strings for all 10M rows before grouping them. Sail's
+    DataFusion plan streams the join straight into the aggregate.
+  - Sail is slightly ahead on `distinct` and string grouping, within 10%.
+- **Spark SQL** is 4–15× slower than both on this single machine. Part of
+  that is fixed per-query overhead: query planning, whole-stage code
+  generation, and scheduling 8 + 8 tasks across two stages. Part is decoding
+  its compressed columnar cache.
+- **No query optimizer.** Vega has no cost-based optimizer. It prunes unused
+  columns and fuses narrow operations, and otherwise runs operations in the
+  order written. Spark and Sail also reorder and rewrite plans, which this
+  benchmark doesn't exercise.
+
+To reproduce:
+
+```bash
+cmake --build build-release --target vega_cpp_dataframe
+pip install pyspark                                   # Spark SQL (Java 17+)
+python -m venv sail && sail/bin/pip install pysail "pyspark-client==4.0.1" pyarrow
+python benchmarks/bench_dataframe.py --n 10000000 --sail-python sail/bin/python
+```
+
+> **Note:** DataFrames are native in C++ ([C++ DataFrames](docs/cpp-dataframes.md)).
+> PyVega provides **RDD** APIs only for now. See
 > [DataFrame-style operations](docs/dataframe-operations.md) for RDD equivalents.
 
 ## Architecture
@@ -298,8 +367,27 @@ int main() {
 
 ### Available operations
 
-The C++ API covers `map`, `filter`, `flatMap`, `reduceByKey`, `groupByKey`
+The C++ RDD API covers `map`, `filter`, `flatMap`, `reduceByKey`, `groupByKey`
 and the `collect` / `count` / `reduce` / `foreach` actions.
+
+C++ also has columnar DataFrames (`#include <vega/dataframe.hpp>`). They
+offer Spark-style column expressions, `select`, `filter`, `with_column`,
+`group_by().agg()` (`sum`, `count`, `avg`, `min`, `max`), broadcast hash
+`join`, `distinct`, `order_by` with top-N `limit`, and `count`, `collect` and
+`show`:
+
+```cpp
+using namespace vega::df;
+auto top = sales.filter(col("qty") > 1)
+                .join(stores, {"store"})
+                .group_by({col("region")})
+                .agg({sum(col("qty") * col("price")).alias("revenue")})
+                .order_by({desc(col("revenue"))})
+                .limit(10);
+std::cout << top.show();
+```
+
+See [C++ DataFrames](docs/cpp-dataframes.md).
 
 PyVega implements the PySpark RDD API: element-wise and partition
 transformations, all key/value operations (`reduceByKey`, `combineByKey`,
