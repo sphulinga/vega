@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
-## [Unreleased]
+## [2.0.1] - 2026-11-20
 
 ### Fixed
 - **Multi-process C++ cluster mode (`vega::Cluster`) works end to end.** A job
@@ -19,6 +19,9 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   `scatter` sends every partition to its owner, and owners wait for theirs.
   The router unblocks its connection threads on `stop()`. A new test runs
   scatter, a narrow job and a shuffle job on three peers over localhost TCP.
+- `TcpServer` no longer races its accept thread on the listening socket, and
+  `stop()` works on macOS, where `shutdown()` doesn't wake a blocked `accept()`.
+  The accept loop now polls with a timeout.
 - `cluster_word_count` now counts words in cluster mode; it used to only
   collect the input lines.
 
